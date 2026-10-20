@@ -131,3 +131,90 @@ class TestPolarsImport(unittest.TestCase):
         view = from_arrow(pl.Series("a", [1.0, None, 3.0]))
         self.assertEqual(view.null_count, 1)
         self.assertEqual(view.data[2], 3.0)
+
+
+@requires_pyarrow
+class TestNumbaArrow(unittest.TestCase):
+    def test_typeof(self):
+        from numba.experimental.arrow import ArrowArrayType
+
+        ty = typeof(from_arrow(pa.array([1, 2])))
+        self.assertIsInstance(ty, ArrowArrayType)
+        self.assertEqual(ty.dtype, types.int64)
+        self.assertEqual(ty, ArrowArrayType(types.int64))
+
+    def test_len_and_getitem(self):
+        @jit
+        def f(arr):
+            return len(arr), arr[1], arr[-1]
+
+        self.assertEqual(f(from_arrow(pa.array([10, 20, 30]))), (3, 20, 30))
+
+    def test_data_attribute(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(f(from_arrow(pa.array([1.0, 2.0, 3.0]))), 6.0)
+
+    def test_loop_sum(self):
+        @jit
+        def f(arr):
+            total = 0
+            for i in range(len(arr)):
+                total += arr[i]
+            return total
+
+        self.assertEqual(f(from_arrow(pa.array([1, 2, 3, 4]))), 10)
+
+    def test_repeated_calls(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        for _ in range(200):
+            self.assertEqual(f(from_arrow(pa.array([1, 2]))), 3)
+
+    @requires_polars
+    def test_polars_series_in_jit(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(f(from_arrow(pl.Series("a", [1.0, 2.0]))), 3.0)
+
+    def test_is_valid(self):
+        view = from_arrow(pa.array([1.0, None, 3.0]))
+
+        @jit
+        def mask(arr):
+            return [arr.is_valid(i) for i in range(len(arr))]
+
+        self.assertEqual(mask(view), [True, False, True])
+
+    def test_sum_non_null(self):
+        @jit
+        def f(arr):
+            total = 0.0
+            for i in range(len(arr)):
+                if arr.is_valid(i):
+                    total += arr[i]
+            return total
+
+        self.assertEqual(f(from_arrow(pa.array([1.0, None, 3.0]))), 4.0)
+
+    def test_is_valid_negative_index(self):
+        @jit
+        def f(arr):
+            return arr.is_valid(-1)
+
+        self.assertTrue(f(from_arrow(pa.array([1, 2]))))
+        self.assertFalse(f(from_arrow(pa.array([1, None]))))
+
+    def test_is_valid_out_of_range(self):
+        @jit
+        def f(arr):
+            return arr.is_valid(5)
+
+        with self.assertRaises(IndexError):
+            f(from_arrow(pa.array([1, 2])))

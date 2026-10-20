@@ -5,11 +5,25 @@ Arrays are imported through the Arrow PyCapsule interface, so any producer
 """
 
 import ctypes
+import operator
 import weakref
 
 import numpy as np
 
-__all__ = ["ArrowArrayView", "from_arrow"]
+from numba.core import cgutils, types
+from numba.core.datamodel import models
+from numba.core.typing.typeof import typeof_impl
+from numba.extending import (
+    NativeValue,
+    make_attribute_wrapper,
+    overload,
+    overload_method,
+    register_model,
+    unbox,
+)
+from numba.np import numpy_support
+
+__all__ = ["ArrowArrayType", "ArrowArrayView", "from_arrow"]
 
 
 class _ArrowSchema(ctypes.Structure):
@@ -270,3 +284,88 @@ def from_arrow(obj):
                 f"or __arrow_c_stream__")
         schema, array = _from_stream(export())
     return _build(schema, array)
+
+
+class ArrowArrayType(types.Type):
+    """Numba type of a 1-D fixed-width Arrow array."""
+
+    def __init__(self, dtype):
+        self.dtype = dtype
+        super().__init__(name=f"ArrowArray({dtype})")
+
+    @property
+    def key(self):
+        return self.dtype
+
+    @property
+    def array_type(self):
+        return types.Array(self.dtype, 1, "C")
+
+
+@register_model(ArrowArrayType)
+class _ArrowArrayModel(models.StructModel):
+    def __init__(self, dmm, fe_type):
+        members = [
+            ("data", fe_type.array_type),
+            ("valid", types.Array(types.uint8, 1, "C")),
+            ("length", types.intp),
+            ("null_count", types.intp),
+            ("offset", types.intp),
+        ]
+        super().__init__(dmm, fe_type, members)
+
+
+for _name in ("data", "valid", "length", "null_count", "offset"):
+    make_attribute_wrapper(ArrowArrayType, _name, _name)
+
+
+@typeof_impl.register(ArrowArrayView)
+def _typeof_arrow_array(val, c):
+    for name in ("data", "valid", "length", "null_count", "offset"):
+        if not hasattr(val, name):
+            raise TypeError(f"ArrowArrayView is missing attribute {name!r}")
+    return ArrowArrayType(numpy_support.from_dtype(val.dtype))
+
+
+@unbox(ArrowArrayType)
+def _unbox_arrow_array(typ, obj, c):
+    model = c.context.data_model_manager[typ]
+    proxy = cgutils.create_struct_proxy(typ)(c.context, c.builder)
+    is_error = cgutils.alloca_once_value(c.builder, cgutils.false_bit)
+    for name in ("data", "valid", "length", "null_count", "offset"):
+        field_type = model.get_member_fe_type(name)
+        attr = c.pyapi.object_getattr_string(obj, name)
+        native = c.unbox(field_type, attr)
+        c.pyapi.decref(attr)
+        setattr(proxy, name, native.value)
+        if native.is_error is not None:
+            with c.builder.if_then(native.is_error, likely=False):
+                c.builder.store(cgutils.true_bit, is_error)
+    return NativeValue(proxy._getvalue(), is_error=c.builder.load(is_error))
+
+
+@overload(len)
+def _ol_len(arr):
+    if isinstance(arr, ArrowArrayType):
+        return lambda arr: arr.length
+
+
+@overload(operator.getitem)
+def _ol_getitem(arr, index):
+    if isinstance(arr, ArrowArrayType) and isinstance(index, types.Integer):
+        return lambda arr, index: arr.data[index]
+
+
+@overload_method(ArrowArrayType, "is_valid")
+def _ol_is_valid(arr, index):
+    def impl(arr, index):
+        if index < 0:
+            index += arr.length
+        if index < 0 or index >= arr.length:
+            raise IndexError("Arrow array index out of range")
+        if arr.null_count == 0:
+            return True
+        bit = arr.offset + index
+        return ((arr.valid[bit >> 3] >> (bit & 7)) & 1) == 1
+
+    return impl
