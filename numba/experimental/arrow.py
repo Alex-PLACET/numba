@@ -15,6 +15,7 @@ import numpy as np
 
 from numba.core import cgutils, types
 from numba.core.datamodel import models
+from numba.core.decorators import jit
 from numba.core.pythonapi import _UnboxContext
 from numba.core.typing.typeof import _TypeofContext, typeof_impl
 from numba.extending import (
@@ -27,7 +28,7 @@ from numba.extending import (
 )
 from numba.np import numpy_support
 
-__all__ = ["ArrowArrayType", "ArrowArrayView", "from_arrow"]
+__all__ = ["ArrowArrayType", "ArrowArrayView", "arrow_jit", "from_arrow"]
 
 _StructT = TypeVar("_StructT", bound=ctypes.Structure)
 
@@ -141,7 +142,7 @@ def _release_owner(schema: _ArrowSchema, array: _ArrowArray) -> None:
 
 
 class _Owner:
-    __slots__ = ("schema", "array", "_finalizer", "__weakref__")
+    __slots__ = ("__weakref__", "_finalizer", "array", "schema")
 
     schema: _ArrowSchema
     array: _ArrowArray
@@ -199,8 +200,16 @@ def _validity_view(array: _ArrowArray, owner: _Owner) -> np.ndarray:
 class ArrowArrayView:
     """Zero-copy view of an Arrow array, usable from Python and Numba."""
 
-    __slots__ = ("dtype", "data", "valid", "length", "null_count", "offset",
-                 "_owner", "__weakref__")
+    __slots__ = (
+        "__weakref__",
+        "_owner",
+        "data",
+        "dtype",
+        "length",
+        "null_count",
+        "offset",
+        "valid",
+    )
 
     dtype: np.dtype
     data: np.ndarray
@@ -308,6 +317,37 @@ def from_arrow(obj: object) -> ArrowArrayView:
                 f"or __arrow_c_stream__")
         schema, array = _from_stream(export())
     return _build(schema, array)
+
+
+def _view_of(obj: Any) -> Any:
+    if hasattr(obj, "__arrow_c_array__") or hasattr(obj, "__arrow_c_stream__"):
+        return from_arrow(obj)
+    return obj
+
+
+class _ArrowDispatcher:
+    """``jit`` dispatcher that imports Arrow arrays on the way in."""
+
+    def __init__(self, func: Any, **kwargs: Any) -> None:
+        self._dispatcher = jit(func, **kwargs)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._dispatcher(*[_view_of(arg) for arg in args], **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_dispatcher":
+            raise AttributeError(name)
+        return getattr(self._dispatcher, name)
+
+
+def arrow_jit(func: Any = None, **kwargs: Any) -> Any:
+    """Decorate like :func:`numba.jit`, accepting Arrow arrays as arguments.
+
+    Use :func:`from_arrow` instead when the view is also needed in Python.
+    """
+    if func is None:
+        return lambda f: _ArrowDispatcher(f, **kwargs)
+    return _ArrowDispatcher(func, **kwargs)
 
 
 class ArrowArrayType(types.Type):

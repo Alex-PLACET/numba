@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from numba import jit, typeof, types
-from numba.experimental.arrow import ArrowArrayView, from_arrow
+from numba.experimental.arrow import ArrowArrayView, arrow_jit, from_arrow
 
 try:
     import pyarrow as pa
@@ -296,3 +296,47 @@ class TestOwnership(unittest.TestCase):
             return [arr.is_valid(i) for i in range(len(arr))]
 
         self.assertEqual(mask(view), [True, False])
+
+
+@requires_pyarrow
+class TestArrowJit(unittest.TestCase):
+    def test_pyarrow_array(self):
+        @arrow_jit
+        def total(arr):
+            acc = 0
+            for i in range(len(arr)):
+                acc += arr[i]
+            return acc
+
+        self.assertEqual(total(pa.array([1, 2, 3])), 6)
+
+    @requires_polars
+    def test_polars_series(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(total(pl.Series("a", [1.0, 2.0])), 3.0)
+
+    def test_non_arrow_argument(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr)
+
+        self.assertEqual(total(np.array([1, 2, 3])), 6)
+
+    def test_jit_options(self):
+        @arrow_jit(nogil=True)
+        def total(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(total(pa.array([1, 2, 3])), 6)
+
+    def test_dispatcher_attributes(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr.data)
+
+        total(pa.array([1]))
+        self.assertEqual(len(total.signatures), 1)
+        self.assertEqual(total.py_func(from_arrow(pa.array([1, 2]))), 3)
