@@ -218,3 +218,81 @@ class TestNumbaArrow(unittest.TestCase):
 
         with self.assertRaises(IndexError):
             f(from_arrow(pa.array([1, 2])))
+
+
+from numba.experimental.arrow import _ArrowArray, _ArrowSchema  # noqa: E402
+
+_ArrayRelease = ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowArray))
+
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+_PyCapsule_New.restype = ctypes.py_object
+
+
+class _Producer:
+    """Minimal ArrowArray producer used to observe the release callback."""
+
+    def __init__(self, values, null_count=0, valid_bytes=None):
+        self.released = 0
+        self._values = (ctypes.c_int64 * len(values))(*values)
+        self._bitmap = None
+        if valid_bytes is not None:
+            self._bitmap = ctypes.create_string_buffer(valid_bytes)
+        self._buffers = (ctypes.c_void_p * 2)()
+        if self._bitmap is not None:
+            self._buffers[0] = ctypes.cast(self._bitmap, ctypes.c_void_p)
+        self._buffers[1] = ctypes.cast(self._values, ctypes.c_void_p)
+        self._format = ctypes.create_string_buffer(b"l")
+        self._callback = _ArrayRelease(self._on_release)
+        self._array = _ArrowArray(
+            length=len(values), null_count=null_count, offset=0, n_buffers=2,
+            n_children=0, buffers=self._buffers, children=None,
+            dictionary=None,
+            release=ctypes.cast(self._callback, ctypes.c_void_p),
+            private_data=None)
+        self._schema = _ArrowSchema(
+            format=ctypes.cast(self._format, ctypes.c_char_p), name=None,
+            metadata=None, flags=0, n_children=0, children=None,
+            dictionary=None, release=None, private_data=None)
+
+    def _on_release(self, ptr):
+        self.released += 1
+
+    def __arrow_c_array__(self, requested_schema=None):
+        schema = _PyCapsule_New(
+            ctypes.addressof(self._schema), b"arrow_schema", None)
+        array = _PyCapsule_New(
+            ctypes.addressof(self._array), b"arrow_array", None)
+        return schema, array
+
+
+class TestOwnership(unittest.TestCase):
+    def test_release_on_gc(self):
+        producer = _Producer([1, 2, 3])
+        view = from_arrow(producer)
+        self.assertEqual(view.data.tolist(), [1, 2, 3])
+        self.assertEqual(producer.released, 0)
+        del view
+        gc.collect()
+        self.assertEqual(producer.released, 1)
+
+    def test_arrays_keep_owner_alive(self):
+        producer = _Producer([1, 2, 3])
+        data = from_arrow(producer).data
+        gc.collect()
+        self.assertEqual(producer.released, 0)
+        self.assertEqual(data.tolist(), [1, 2, 3])
+        del data
+        gc.collect()
+        self.assertEqual(producer.released, 1)
+
+    def test_unknown_null_count(self):
+        producer = _Producer([1, 2], null_count=-1, valid_bytes=b"\x01")
+        view = from_arrow(producer)
+        self.assertEqual(view.null_count, -1)
+
+        @jit
+        def mask(arr):
+            return [arr.is_valid(i) for i in range(len(arr))]
+
+        self.assertEqual(mask(view), [True, False])
