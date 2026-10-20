@@ -4,15 +4,19 @@ Arrays are imported through the Arrow PyCapsule interface, so any producer
 (pyarrow, Polars, nanoarrow, ...) works without depending on it.
 """
 
+from __future__ import annotations
+
 import ctypes
 import operator
 import weakref
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 
 from numba.core import cgutils, types
 from numba.core.datamodel import models
-from numba.core.typing.typeof import typeof_impl
+from numba.core.pythonapi import _UnboxContext
+from numba.core.typing.typeof import _TypeofContext, typeof_impl
 from numba.extending import (
     NativeValue,
     make_attribute_wrapper,
@@ -24,6 +28,8 @@ from numba.extending import (
 from numba.np import numpy_support
 
 __all__ = ["ArrowArrayType", "ArrowArrayView", "from_arrow"]
+
+_StructT = TypeVar("_StructT", bound=ctypes.Structure)
 
 
 class _ArrowSchema(ctypes.Structure):
@@ -85,7 +91,7 @@ _PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 _PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 _PyCapsule_GetPointer.restype = ctypes.c_void_p
 
-_FORMATS = {
+_FORMATS: dict[str, str] = {
     "c": "int8",
     "C": "uint8",
     "s": "int16",
@@ -100,10 +106,10 @@ _FORMATS = {
     "tdD": "datetime64[D]",
     "tdm": "datetime64[ms]",
 }
-_TIME_UNITS = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
+_TIME_UNITS: dict[str, str] = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
 
 
-def _capsule_pointer(capsule, name):
+def _capsule_pointer(capsule: object, name: bytes) -> int:
     if not _PyCapsule_IsValid(capsule, name):
         raise TypeError(
             f"expected a PyCapsule named {name.decode()!r}, "
@@ -112,7 +118,8 @@ def _capsule_pointer(capsule, name):
     return _PyCapsule_GetPointer(capsule, name)
 
 
-def _take(struct_type, capsule, name):
+def _take(struct_type: type[_StructT], capsule: object,
+          name: bytes) -> _StructT:
     addr = _capsule_pointer(capsule, name)
     src = struct_type.from_address(addr)
     dst = struct_type()
@@ -121,13 +128,14 @@ def _take(struct_type, capsule, name):
     return dst
 
 
-def _release_struct(struct, release_type):
+def _release_struct(struct: ctypes.Structure,
+                    release_type: Callable[..., Any]) -> None:
     if struct.release:
         release_type(struct.release)(ctypes.byref(struct))
         struct.release = None
 
 
-def _release_owner(schema, array):
+def _release_owner(schema: _ArrowSchema, array: _ArrowArray) -> None:
     _release_struct(array, _ArrayRelease)
     _release_struct(schema, _SchemaRelease)
 
@@ -135,13 +143,17 @@ def _release_owner(schema, array):
 class _Owner:
     __slots__ = ("schema", "array", "_finalizer", "__weakref__")
 
-    def __init__(self, schema, array):
+    schema: _ArrowSchema
+    array: _ArrowArray
+    _finalizer: weakref.finalize
+
+    def __init__(self, schema: _ArrowSchema, array: _ArrowArray) -> None:
         self.schema = schema
         self.array = array
         self._finalizer = weakref.finalize(self, _release_owner, schema, array)
 
 
-def _dtype_from_format(fmt):
+def _dtype_from_format(fmt: str) -> np.dtype:
     if fmt == "b":
         raise TypeError(
             "Arrow boolean arrays are bit-packed and not supported")
@@ -158,13 +170,14 @@ def _dtype_from_format(fmt):
     raise TypeError(f"unsupported Arrow format string {fmt!r}")
 
 
-def _buffer(ptr, nbytes, owner):
+def _buffer(ptr: int, nbytes: int, owner: _Owner) -> ctypes.Array:
     buf = (ctypes.c_ubyte * nbytes).from_address(ptr)
-    buf._owner = owner
+    setattr(buf, "_owner", owner)
     return buf
 
 
-def _data_view(array, dtype, owner):
+def _data_view(array: _ArrowArray, dtype: np.dtype,
+               owner: _Owner) -> np.ndarray:
     nbytes = array.length * dtype.itemsize
     if nbytes == 0:
         return np.empty(0, dtype=dtype)
@@ -175,7 +188,7 @@ def _data_view(array, dtype, owner):
     return np.frombuffer(buf, dtype=np.uint8).view(dtype)
 
 
-def _validity_view(array, owner):
+def _validity_view(array: _ArrowArray, owner: _Owner) -> np.ndarray:
     if array.n_buffers == 0 or not array.buffers[0]:
         return np.empty(0, dtype=np.uint8)
     nbytes = (array.offset + array.length + 7) // 8
@@ -189,7 +202,17 @@ class ArrowArrayView:
     __slots__ = ("dtype", "data", "valid", "length", "null_count", "offset",
                  "_owner", "__weakref__")
 
-    def __init__(self, dtype, data, valid, length, null_count, offset, owner):
+    dtype: np.dtype
+    data: np.ndarray
+    valid: np.ndarray
+    length: int
+    null_count: int
+    offset: int
+    _owner: _Owner
+
+    def __init__(self, dtype: np.dtype, data: np.ndarray, valid: np.ndarray,
+                 length: int, null_count: int, offset: int,
+                 owner: _Owner) -> None:
         self.dtype = dtype
         self.data = data
         self.valid = valid
@@ -198,18 +221,18 @@ class ArrowArrayView:
         self.offset = offset
         self._owner = owner
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Any:
         return self.data[index]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (f"ArrowArrayView({self.dtype}, length={self.length}, "
                 f"null_count={self.null_count})")
 
 
-def _build(schema, array):
+def _build(schema: _ArrowSchema, array: _ArrowArray) -> ArrowArrayView:
     owner = _Owner(schema, array)
     if schema.dictionary:
         raise TypeError("dictionary-encoded Arrow arrays are not supported")
@@ -225,14 +248,15 @@ def _build(schema, array):
                           array.offset, owner)
 
 
-def _stream_error(stream, get_error):
+def _stream_error(stream: _ArrowArrayStream,
+                  get_error: Callable[..., Any] | None) -> str:
     if get_error is None:
         return "Arrow stream error"
     msg = get_error(ctypes.byref(stream))
     return f"Arrow stream error: {msg.decode() if msg else 'unknown error'}"
 
 
-def _from_stream(capsule):
+def _from_stream(capsule: object) -> tuple[_ArrowSchema, _ArrowArray]:
     stream = _take(_ArrowArrayStream, capsule, b"arrow_array_stream")
     get_schema = _StreamGetSchema(stream.get_schema)
     get_next = _StreamGetNext(stream.get_next)
@@ -265,7 +289,7 @@ def _from_stream(capsule):
     return schema, array
 
 
-def from_arrow(obj):
+def from_arrow(obj: object) -> ArrowArrayView:
     """Import an Arrow array as a zero-copy :class:`ArrowArrayView`.
 
     *obj* must implement ``__arrow_c_array__`` (single array) or
@@ -289,22 +313,24 @@ def from_arrow(obj):
 class ArrowArrayType(types.Type):
     """Numba type of a 1-D fixed-width Arrow array."""
 
-    def __init__(self, dtype):
+    dtype: types.Type
+
+    def __init__(self, dtype: types.Type) -> None:
         self.dtype = dtype
         super().__init__(name=f"ArrowArray({dtype})")
 
     @property
-    def key(self):
+    def key(self) -> types.Type:
         return self.dtype
 
     @property
-    def array_type(self):
+    def array_type(self) -> types.Array:
         return types.Array(self.dtype, 1, "C")
 
 
 @register_model(ArrowArrayType)
 class _ArrowArrayModel(models.StructModel):
-    def __init__(self, dmm, fe_type):
+    def __init__(self, dmm: Any, fe_type: ArrowArrayType) -> None:
         members = [
             ("data", fe_type.array_type),
             ("valid", types.Array(types.uint8, 1, "C")),
@@ -320,7 +346,8 @@ for _name in ("data", "valid", "length", "null_count", "offset"):
 
 
 @typeof_impl.register(ArrowArrayView)
-def _typeof_arrow_array(val, c):
+def _typeof_arrow_array(val: ArrowArrayView,
+                        c: _TypeofContext) -> ArrowArrayType:
     for name in ("data", "valid", "length", "null_count", "offset"):
         if not hasattr(val, name):
             raise TypeError(f"ArrowArrayView is missing attribute {name!r}")
@@ -328,7 +355,8 @@ def _typeof_arrow_array(val, c):
 
 
 @unbox(ArrowArrayType)
-def _unbox_arrow_array(typ, obj, c):
+def _unbox_arrow_array(typ: ArrowArrayType, obj: Any,
+                       c: _UnboxContext) -> NativeValue:
     model = c.context.data_model_manager[typ]
     proxy = cgutils.create_struct_proxy(typ)(c.context, c.builder)
     is_error = cgutils.alloca_once_value(c.builder, cgutils.false_bit)
