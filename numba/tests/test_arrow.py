@@ -99,3 +99,35 @@ class TestArrowImport(unittest.TestCase):
         with self.assertRaises(TypeError) as cm:
             from_arrow(pa.array([[1, 2], [3]]))
         self.assertIn("nested", str(cm.exception))
+
+
+@requires_pyarrow
+class TestArrowStream(unittest.TestCase):
+    def test_single_chunk(self):
+        view = from_arrow(pa.chunked_array([[1, 2, 3]]))
+        self.assertEqual(len(view), 3)
+        self.assertEqual(view.dtype, np.dtype("int64"))
+        np.testing.assert_array_equal(view.data, [1, 2, 3])
+
+    def test_multiple_chunks_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.chunked_array([[1, 2], [3]]))
+        self.assertIn("chunk", str(cm.exception))
+
+    def test_not_exportable(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow([1, 2, 3])
+        self.assertIn("__arrow_c_array__", str(cm.exception))
+
+
+@requires_polars
+class TestPolarsImport(unittest.TestCase):
+    def test_series(self):
+        view = from_arrow(pl.Series("a", [1, 2, 3]))
+        self.assertEqual(view.dtype, np.dtype("int64"))
+        np.testing.assert_array_equal(view.data, [1, 2, 3])
+
+    def test_series_float_with_null(self):
+        view = from_arrow(pl.Series("a", [1.0, None, 3.0]))
+        self.assertEqual(view.null_count, 1)
+        self.assertEqual(view.data[2], 3.0)

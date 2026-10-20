@@ -41,8 +41,27 @@ class _ArrowArray(ctypes.Structure):
     ]
 
 
+class _ArrowArrayStream(ctypes.Structure):
+    _fields_ = [
+        ("get_schema", ctypes.c_void_p),
+        ("get_next", ctypes.c_void_p),
+        ("get_last_error", ctypes.c_void_p),
+        ("release", ctypes.c_void_p),
+        ("private_data", ctypes.c_void_p),
+    ]
+
+
 _SchemaRelease = ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowSchema))
 _ArrayRelease = ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowArray))
+_StreamRelease = ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowArrayStream))
+_StreamGetSchema = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(_ArrowArrayStream),
+    ctypes.POINTER(_ArrowSchema))
+_StreamGetNext = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(_ArrowArrayStream),
+    ctypes.POINTER(_ArrowArray))
+_StreamGetError = ctypes.CFUNCTYPE(
+    ctypes.c_char_p, ctypes.POINTER(_ArrowArrayStream))
 
 _PyCapsule_IsValid = ctypes.pythonapi.PyCapsule_IsValid
 _PyCapsule_IsValid.argtypes = [ctypes.py_object, ctypes.c_char_p]
@@ -192,16 +211,62 @@ def _build(schema, array):
                           array.offset, owner)
 
 
+def _stream_error(stream, get_error):
+    if get_error is None:
+        return "Arrow stream error"
+    msg = get_error(ctypes.byref(stream))
+    return f"Arrow stream error: {msg.decode() if msg else 'unknown error'}"
+
+
+def _from_stream(capsule):
+    stream = _take(_ArrowArrayStream, capsule, b"arrow_array_stream")
+    get_schema = _StreamGetSchema(stream.get_schema)
+    get_next = _StreamGetNext(stream.get_next)
+    get_error = (_StreamGetError(stream.get_last_error)
+                 if stream.get_last_error else None)
+    schema = _ArrowSchema()
+    array = _ArrowArray()
+    status = get_schema(ctypes.byref(stream), ctypes.byref(schema))
+    if not status:
+        status = get_next(ctypes.byref(stream), ctypes.byref(array))
+    error = _stream_error(stream, get_error) if status else None
+    if error is None and not array.release:
+        error = "Arrow stream is empty"
+    has_more = False
+    if error is None:
+        extra = _ArrowArray()
+        has_more = (get_next(ctypes.byref(stream), ctypes.byref(extra)) == 0
+                    and bool(extra.release))
+        if has_more:
+            _release_struct(extra, _ArrayRelease)
+    _release_struct(stream, _StreamRelease)
+    if error is not None or has_more:
+        _release_struct(array, _ArrayRelease)
+        _release_struct(schema, _SchemaRelease)
+        if has_more:
+            raise TypeError(
+                "Arrow chunked arrays with more than one chunk are not "
+                "supported")
+        raise ValueError(error)
+    return schema, array
+
+
 def from_arrow(obj):
     """Import an Arrow array as a zero-copy :class:`ArrowArrayView`.
 
-    *obj* must implement ``__arrow_c_array__``.
+    *obj* must implement ``__arrow_c_array__`` (single array) or
+    ``__arrow_c_stream__`` (single-chunk stream).
     """
     export = getattr(obj, "__arrow_c_array__", None)
-    if export is None:
-        raise TypeError(
-            f"{type(obj).__name__} does not implement __arrow_c_array__")
-    schema_capsule, array_capsule = export()
-    schema = _take(_ArrowSchema, schema_capsule, b"arrow_schema")
-    array = _take(_ArrowArray, array_capsule, b"arrow_array")
+    if export is not None:
+        schema_capsule, array_capsule = export()
+        schema = _take(_ArrowSchema, schema_capsule, b"arrow_schema")
+        array = _take(_ArrowArray, array_capsule, b"arrow_array")
+    else:
+        export = getattr(obj, "__arrow_c_stream__", None)
+        if export is None:
+            raise TypeError(
+                f"{type(obj).__name__} does not implement __arrow_c_array__ "
+                f"or __arrow_c_stream__")
+        schema, array = _from_stream(export())
     return _build(schema, array)
