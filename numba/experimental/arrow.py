@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import ctypes
 import operator
-import weakref
 from typing import Any, Callable, TypeVar
 
 import numpy as np
@@ -84,10 +83,6 @@ _StreamGetNext = ctypes.CFUNCTYPE(
 _StreamGetError = ctypes.CFUNCTYPE(
     ctypes.c_char_p, ctypes.POINTER(_ArrowArrayStream))
 
-_PyCapsule_IsValid = ctypes.pythonapi.PyCapsule_IsValid
-_PyCapsule_IsValid.argtypes = [ctypes.py_object, ctypes.c_char_p]
-_PyCapsule_IsValid.restype = ctypes.c_int
-
 _PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 _PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 _PyCapsule_GetPointer.restype = ctypes.c_void_p
@@ -111,12 +106,13 @@ _TIME_UNITS: dict[str, str] = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
 
 
 def _capsule_pointer(capsule: object, name: bytes) -> int:
-    if not _PyCapsule_IsValid(capsule, name):
+    try:
+        return _PyCapsule_GetPointer(capsule, name)
+    except ValueError:
         raise TypeError(
             f"expected a PyCapsule named {name.decode()!r}, "
             f"got {type(capsule).__name__}"
-        )
-    return _PyCapsule_GetPointer(capsule, name)
+        ) from None
 
 
 def _take(struct_type: type[_StructT], capsule: object,
@@ -136,22 +132,24 @@ def _release_struct(struct: ctypes.Structure,
         struct.release = None
 
 
-def _release_owner(schema: _ArrowSchema, array: _ArrowArray) -> None:
-    _release_struct(array, _ArrayRelease)
-    _release_struct(schema, _SchemaRelease)
-
-
 class _Owner:
-    __slots__ = ("__weakref__", "_finalizer", "array", "schema")
+    """Releases the imported Arrow structs when the last view dies."""
+
+    __slots__ = ("schema", "array")
 
     schema: _ArrowSchema
     array: _ArrowArray
-    _finalizer: weakref.finalize
 
     def __init__(self, schema: _ArrowSchema, array: _ArrowArray) -> None:
         self.schema = schema
         self.array = array
-        self._finalizer = weakref.finalize(self, _release_owner, schema, array)
+
+    def __del__(self) -> None:
+        try:
+            _release_struct(self.array, _ArrayRelease)
+            _release_struct(self.schema, _SchemaRelease)
+        except Exception:
+            pass  # interpreter shutdown may already have cleared globals
 
 
 def _dtype_from_format(fmt: str) -> np.dtype:
@@ -384,6 +382,16 @@ class _ArrowArrayModel(models.StructModel):
 for _name in ("data", "valid", "length", "null_count", "offset"):
     make_attribute_wrapper(ArrowArrayType, _name, _name)
 
+_TYPE_CACHE: dict[np.dtype, ArrowArrayType] = {}
+
+
+def _arrow_type(dtype: np.dtype) -> ArrowArrayType:
+    typ = _TYPE_CACHE.get(dtype)
+    if typ is None:
+        typ = ArrowArrayType(numpy_support.from_dtype(dtype))
+        _TYPE_CACHE[dtype] = typ
+    return typ
+
 
 @typeof_impl.register(ArrowArrayView)
 def _typeof_arrow_array(val: ArrowArrayView,
@@ -391,7 +399,7 @@ def _typeof_arrow_array(val: ArrowArrayView,
     for name in ("data", "valid", "length", "null_count", "offset"):
         if not hasattr(val, name):
             raise TypeError(f"ArrowArrayView is missing attribute {name!r}")
-    return ArrowArrayType(numpy_support.from_dtype(val.dtype))
+    return _arrow_type(val.dtype)
 
 
 @unbox(ArrowArrayType)

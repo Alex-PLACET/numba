@@ -267,6 +267,15 @@ class _Producer:
 
 
 class TestOwnership(unittest.TestCase):
+    def test_bad_capsule_name(self):
+        class Fake:
+            def __arrow_c_array__(self, requested_schema=None):
+                return object(), object()
+
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(Fake())
+        self.assertIn("arrow_schema", str(cm.exception))
+
     def test_release_on_gc(self):
         producer = _Producer([1, 2, 3])
         view = from_arrow(producer)
