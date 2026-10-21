@@ -69,6 +69,7 @@ from numba.core.pythonapi import _UnboxContext
 from numba.core.typing.typeof import _TypeofContext, typeof_impl
 from numba.extending import (
     NativeValue,
+    box,
     intrinsic,
     make_attribute_wrapper,
     overload,
@@ -145,6 +146,10 @@ _PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 _PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 _PyCapsule_GetPointer.restype = ctypes.c_void_p
 
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+_PyCapsule_New.restype = ctypes.py_object
+
 _FORMATS: dict[str, str] = {
     "c": "int8",
     "C": "uint8",
@@ -161,6 +166,11 @@ _FORMATS: dict[str, str] = {
     "tdm": "datetime64[ms]",
 }
 _TIME_UNITS: dict[str, str] = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
+_FORMATS_INV = {np.dtype(v): k for k, v in _FORMATS.items()
+                if v not in ("datetime64[D]", "datetime64[ms]")}
+_FORMATS_INV[np.dtype("datetime64[D]")] = "tdD"
+_UNIT_CODES = {"s": "s", "ms": "m", "us": "u", "ns": "n"}
+_ARROW_FLAG_NULLABLE = 2
 
 _EMPTY: dict[np.dtype, np.ndarray] = {}
 
@@ -222,6 +232,18 @@ class _Owner:
             pass  # interpreter shutdown may already have cleared globals
 
 
+def _format_of(dtype: np.dtype) -> bytes:
+    fmt = _FORMATS_INV.get(dtype)
+    if fmt is not None:
+        return fmt.encode()
+    code = _UNIT_CODES.get(np.datetime_data(dtype)[0])
+    if code is not None:
+        if dtype.kind == "M":
+            return f"ts{code}:".encode()
+        return f"tD{code}".encode()
+    raise TypeError(f"cannot export dtype {dtype}")
+
+
 def _dtype_from_format(fmt: str) -> np.dtype:
     if fmt == "b":
         raise TypeError(
@@ -271,6 +293,7 @@ class ArrowArrayView:
         "_owner",
         "data",
         "dtype",
+        "format",
         "length",
         "null_count",
         "offset",
@@ -283,18 +306,24 @@ class ArrowArrayView:
     length: int
     null_count: int
     offset: int
-    _owner: _Owner
+    format: str
+    _owner: _Owner | None
 
     def __init__(self, dtype: np.dtype, data: np.ndarray, valid: np.ndarray,
                  length: int, null_count: int, offset: int,
-                 owner: _Owner) -> None:
+                 owner: _Owner | None = None, fmt: str = "") -> None:
         self.dtype = dtype
         self.data = data
         self.valid = valid
         self.length = length
         self.null_count = null_count
         self.offset = offset
+        self.format = fmt
         self._owner = owner
+
+    def __arrow_c_array__(self, requested_schema: Any = None) -> tuple:
+        """Export through the Arrow PyCapsule interface."""
+        return _Exported(self).capsules()
 
     def __len__(self) -> int:
         return self.length
@@ -327,7 +356,63 @@ def _build(schema: _ArrowSchema, array: _ArrowArray) -> ArrowArrayView:
     valid = _validity_view(array, owner)
     null_count = array.null_count if valid.size else 0
     return ArrowArrayView(dtype, data, valid, array.length, null_count,
-                          array.offset, owner)
+                          array.offset, owner, fmt)
+
+
+_EXPORTED: dict[int, _Exported] = {}
+
+
+class _Exported:
+    """Owns the exported structs until the consumer releases the array."""
+
+    __slots__ = ("array", "buffers", "fmt", "schema", "_array_cb",
+                 "_schema_cb")
+
+    def __init__(self, view: ArrowArrayView) -> None:
+        fmt = view.format.encode() if view.format else _format_of(view.dtype)
+        self.fmt = ctypes.create_string_buffer(fmt)
+        self._schema_cb = _SchemaRelease(self._release_schema)
+        self._array_cb = _ArrayRelease(self._release_array)
+        self.schema = _ArrowSchema(
+            format=ctypes.cast(self.fmt, ctypes.c_char_p), name=None,
+            metadata=None,
+            flags=_ARROW_FLAG_NULLABLE if view.null_count else 0,
+            n_children=0, children=None, dictionary=None,
+            release=ctypes.cast(self._schema_cb, ctypes.c_void_p),
+            private_data=None)
+        self.buffers = (ctypes.c_void_p * 2)()
+        if view.null_count:
+            self.buffers[0] = view.valid.ctypes.data
+        if view.length:
+            self.buffers[1] = (view.data.ctypes.data
+                               - view.offset * view.dtype.itemsize)
+            offset = view.offset
+        else:
+            self.buffers[1] = view.data.ctypes.data
+            offset = 0
+        self.array = _ArrowArray(
+            length=view.length, null_count=view.null_count, offset=offset,
+            n_buffers=2, n_children=0, buffers=self.buffers, children=None,
+            dictionary=None,
+            release=ctypes.cast(self._array_cb, ctypes.c_void_p),
+            private_data=None)
+        key = ctypes.addressof(self.array)
+        self.array.private_data = ctypes.c_void_p(key)
+        _EXPORTED[key] = self
+
+    def _release_array(self, ptr: Any, _registry: dict = _EXPORTED) -> None:
+        struct = ptr.contents
+        struct.release = None
+        _registry.pop(struct.private_data, None)
+
+    def _release_schema(self, ptr: Any) -> None:
+        ptr.contents.release = None
+
+    def capsules(self) -> tuple:
+        return (_PyCapsule_New(ctypes.addressof(self.schema),
+                               b"arrow_schema", None),
+                _PyCapsule_New(ctypes.addressof(self.array),
+                               b"arrow_array", None))
 
 
 def _stream_error(stream: _ArrowArrayStream,
@@ -395,6 +480,8 @@ def from_arrow(obj: object) -> ArrowArrayView:
 
 
 def _view_of(obj: Any) -> Any:
+    if isinstance(obj, ArrowArrayView):
+        return obj
     if hasattr(obj, "__arrow_c_array__") or hasattr(obj, "__arrow_c_stream__"):
         return from_arrow(obj)
     return obj
@@ -496,6 +583,24 @@ def _unbox_arrow_array(typ: ArrowArrayType, obj: Any,
             with c.builder.if_then(native.is_error, likely=False):
                 c.builder.store(cgutils.true_bit, is_error)
     return NativeValue(proxy._getvalue(), is_error=c.builder.load(is_error))
+
+
+@box(ArrowArrayType)
+def _box_arrow_array(typ: ArrowArrayType, val: Any, c: Any) -> Any:
+    proxy = c.context.make_helper(c.builder, typ, value=val)
+    pyapi = c.pyapi
+    view_cls = pyapi.unserialize(pyapi.serialize_object(ArrowArrayView))
+    dtype = pyapi.unserialize(
+        pyapi.serialize_object(numpy_support.as_dtype(typ.dtype)))
+    args = (
+        dtype,
+        c.box(typ.array_type, proxy.data),
+        c.box(types.Array(types.uint8, 1, "C"), proxy.valid),
+        c.box(types.intp, proxy.length),
+        c.box(types.intp, proxy.null_count),
+        c.box(types.intp, proxy.offset),
+    )
+    return pyapi.call_function_objargs(view_cls, args)
 
 
 @overload(len)

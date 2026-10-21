@@ -667,3 +667,82 @@ class TestArrowNoBitmap(unittest.TestCase):
                 view[3]
             with self.assertRaises(IndexError):
                 view[-4]
+
+
+@requires_pyarrow
+class TestArrowBox(unittest.TestCase):
+    def test_identity_returns_arrow_array(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        out = identity(pa.array([1, 2, 3]))
+        self.assertIsInstance(out, ArrowArrayView)
+        self.assertEqual(out.dtype, np.dtype("int64"))
+        self.assertEqual(pa.array(out).to_pylist(), [1, 2, 3])
+
+    def test_roundtrip_keeps_nulls(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        out = identity(pa.array([1, None, 3], type=pa.int64()))
+        self.assertEqual(out.null_count, 1)
+        self.assertEqual(pa.array(out).to_pylist(), [1, None, 3])
+
+    def test_roundtrip_each_dtype(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        for src in (pa.array([1], type=pa.int8()),
+                    pa.array([1], type=pa.uint64()),
+                    pa.array([2.0], type=pa.float32()),
+                    pa.array([1], type=pa.timestamp("us")),
+                    pa.array([1], type=pa.duration("ns"))):
+            with self.subTest(str(src.type)):
+                back = pa.array(identity(src))
+                self.assertEqual(back.type, src.type)
+                self.assertEqual(back.cast(pa.int64()).to_pylist(),
+                                 src.cast(pa.int64()).to_pylist())
+
+    def test_export_survives_source_gc(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        out = identity(pa.array(list(range(1000))))
+        gc.collect()
+        self.assertEqual(pa.array(out).to_pylist()[:3], [0, 1, 2])
+        self.assertEqual(int(out.data[0]), 0)
+
+    def test_view_argument_is_not_reimported(self):
+        import numba.experimental.arrow as arrow_mod
+
+        calls = []
+        original = arrow_mod.from_arrow
+
+        def spy(obj):
+            calls.append(obj)
+            return original(obj)
+
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        arrow_mod.from_arrow = spy
+        try:
+            identity(from_arrow(pa.array([1, 2])))
+        finally:
+            arrow_mod.from_arrow = original
+        self.assertEqual(calls, [])
+
+    def test_boxed_slice_keeps_offset(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        src = pa.array([1, None, 3, 4, 5]).slice(1)
+        out = identity(src)
+        self.assertEqual(out.offset, 1)
+        self.assertEqual(pa.array(out).to_pylist(), [None, 3, 4, 5])
