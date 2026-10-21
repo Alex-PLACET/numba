@@ -91,11 +91,6 @@ class TestArrowImport(unittest.TestCase):
             from_arrow(pa.array([True, False]))
         self.assertIn("bit-packed", str(cm.exception))
 
-    def test_string_rejected(self):
-        with self.assertRaises(TypeError) as cm:
-            from_arrow(pa.array(["a", "b"]))
-        self.assertIn("unsupported Arrow format", str(cm.exception))
-
     def test_dictionary_rejected(self):
         with self.assertRaises(TypeError) as cm:
             from_arrow(pa.array(["a", "b"]).dictionary_encode())
@@ -746,3 +741,115 @@ class TestArrowBox(unittest.TestCase):
         out = identity(src)
         self.assertEqual(out.offset, 1)
         self.assertEqual(pa.array(out).to_pylist(), [None, 3, 4, 5])
+
+
+@requires_pyarrow
+class TestArrowStringImport(unittest.TestCase):
+    def test_utf8_values(self):
+        src = pa.array(["a", "bcd", "", "xy"])
+        view = from_arrow(src)
+        self.assertEqual(len(view), 4)
+        self.assertEqual([bytes(view[i]) for i in range(4)],
+                         [b"a", b"bcd", b"", b"xy"])
+
+    def test_zero_copy(self):
+        src = pa.array(["a", "bcd"])
+        view = from_arrow(src)
+        self.assertEqual(view.chars.ctypes.data, src.buffers()[2].address)
+        self.assertEqual(view.offsets.ctypes.data, src.buffers()[1].address)
+
+    def test_large_utf8(self):
+        src = pa.array(["a", "bcd"], type=pa.large_string())
+        view = from_arrow(src)
+        self.assertEqual(view.offsets.dtype, np.dtype("int64"))
+        self.assertEqual(bytes(view[1]), b"bcd")
+
+    def test_nulls(self):
+        src = pa.array(["a", None, "bcd"])
+        view = from_arrow(src)
+        self.assertEqual(view.null_count, 1)
+        self.assertIsNone(view[1])
+        self.assertEqual(bytes(view[2]), b"bcd")
+
+    def test_slice(self):
+        src = pa.array(["a", "bcd", "", "x"]).slice(1)
+        view = from_arrow(src)
+        self.assertEqual([bytes(view[i]) for i in range(3)],
+                         [b"bcd", b"", b"x"])
+        self.assertEqual(view.offsets.ctypes.data,
+                         src.buffers()[1].address + src.offset * 4)
+
+    def test_empty(self):
+        view = from_arrow(pa.array([], type=pa.string()))
+        self.assertEqual(len(view), 0)
+
+    def test_multibyte(self):
+        src = pa.array(["héllo", "日本語"])
+        view = from_arrow(src)
+        self.assertEqual(bytes(view[0]).decode(), "héllo")
+        self.assertEqual(bytes(view[1]).decode(), "日本語")
+
+    def test_out_of_range(self):
+        view = from_arrow(pa.array(["a"]))
+        with self.assertRaises(IndexError):
+            view[1]
+        with self.assertRaises(IndexError):
+            view[-2]
+
+
+@requires_pyarrow
+class TestArrowStringJit(unittest.TestCase):
+    def test_lengths_in_jit(self):
+        @arrow_jit
+        def lengths(arr):
+            out = np.empty(len(arr), np.int64)
+            for i in range(len(arr)):
+                out[i] = len(arr[i])
+            return out
+
+        self.assertEqual(list(lengths(pa.array(["a", "bcd", "", "xy"]))),
+                         [1, 3, 0, 2])
+
+    def test_bytes_in_jit(self):
+        @arrow_jit
+        def first(arr, i):
+            return arr[i][0]
+
+        @arrow_jit
+        def last(arr, i):
+            text = arr[i]
+            return text[len(text) - 1]
+
+        view = from_arrow(pa.array(["hey", "you"]))
+        self.assertEqual(first(view, 0), ord("h"))
+        self.assertEqual(last(view, 1), ord("u"))
+
+    def test_nullable_in_jit(self):
+        @arrow_jit
+        def total_len(arr):
+            total = 0
+            for i in range(len(arr)):
+                text = arr[i]
+                if text is not None:
+                    total += len(text)
+            return total
+
+        self.assertEqual(total_len(from_arrow(pa.array(["a", None, "bcd"]))), 4)
+
+    def test_is_valid_on_strings(self):
+        @arrow_jit
+        def mask(arr):
+            return [is_valid(arr, i) for i in range(len(arr))]
+
+        view = from_arrow(pa.array(["a", None, "bcd"]))
+        self.assertEqual(mask(view), [True, False, True])
+
+    def test_identity_boxes_string_view(self):
+        @arrow_jit
+        def identity(arr):
+            return arr
+
+        out = identity(pa.array(["a", None, "bcd"]))
+        self.assertEqual(out.length, 3)
+        self.assertEqual(out.null_count, 1)
+        self.assertEqual(bytes(out[2]), b"bcd")
