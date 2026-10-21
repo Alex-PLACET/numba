@@ -67,6 +67,7 @@ from numba.extending import (
     make_attribute_wrapper,
     overload,
     overload_method,
+    register_jitable,
     register_model,
     unbox,
 )
@@ -612,16 +613,8 @@ def _get_or_none(typingctx, arr, index):
     return sig, codegen
 
 
-def _sum_signed_impl(arr):
-    data = arr.data
-    total = 0
-    for i in range(len(data)):
-        total += data[i]
-    if arr.null_count == 0:
-        return total
-    valid = arr.valid
-    offset = arr.offset
-    length = arr.length
+@register_jitable
+def _subtract_nulls(data, total, valid, offset, length):
     for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         if byte != 0xFF:
@@ -631,6 +624,16 @@ def _sum_signed_impl(arr):
                 if 0 <= i < length and not (byte >> k) & 1:
                     total -= data[i]
     return total
+
+
+def _sum_signed_impl(arr):
+    data = arr.data
+    total = 0
+    for i in range(len(data)):
+        total += data[i]
+    if arr.null_count == 0:
+        return total
+    return _subtract_nulls(data, total, arr.valid, arr.offset, arr.length)
 
 
 def _sum_unsigned_impl(arr):
@@ -640,18 +643,7 @@ def _sum_unsigned_impl(arr):
         total += data[i]
     if arr.null_count == 0:
         return total
-    valid = arr.valid
-    offset = arr.offset
-    length = arr.length
-    for b in range(offset >> 3, (offset + length + 7) >> 3):
-        byte = valid[b]
-        if byte != 0xFF:
-            base = b * 8 - offset
-            for k in range(8):
-                i = base + k
-                if 0 <= i < length and not (byte >> k) & 1:
-                    total -= data[i]
-    return total
+    return _subtract_nulls(data, total, arr.valid, arr.offset, arr.length)
 
 
 def _sum_float_impl(arr):
@@ -680,6 +672,8 @@ def _sum_float_impl(arr):
     return total
 
 
+# min and max differ only in the comparison. A shared body with a literal
+# flag measured 4-5% slower at 1M, so the two stay written out.
 def _min_impl(arr):
     data = arr.data
     length = arr.length
@@ -804,11 +798,22 @@ def _ol_max_method(arr):
     return _max_impl
 
 
-def _add_impl(a, b):
-    if a.length != b.length:
+@register_jitable
+def _binary_outputs(a_data, a_length, b_length):
+    if a_length != b_length:
         raise ValueError("Arrow arrays must have the same length")
-    out = np.empty_like(a.data)
-    mask = np.empty(a.length, dtype=np.bool_)
+    return np.empty_like(a_data), np.empty(a_length, np.bool_)
+
+
+@register_jitable
+def _compare_outputs(a_length, b_length):
+    if a_length != b_length:
+        raise ValueError("Arrow arrays must have the same length")
+    return np.empty(a_length, np.bool_), np.empty(a_length, np.bool_)
+
+
+def _add_impl(a, b):
+    out, mask = _binary_outputs(a.data, a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -821,10 +826,7 @@ def _add_impl(a, b):
 
 
 def _sub_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty_like(a.data)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _binary_outputs(a.data, a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -837,10 +839,7 @@ def _sub_impl(a, b):
 
 
 def _mul_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty_like(a.data)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _binary_outputs(a.data, a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -853,10 +852,7 @@ def _mul_impl(a, b):
 
 
 def _truediv_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty_like(a.data)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _binary_outputs(a.data, a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -871,10 +867,7 @@ def _truediv_impl(a, b):
 
 
 def _eq_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -887,10 +880,7 @@ def _eq_impl(a, b):
 
 
 def _ne_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -903,10 +893,7 @@ def _ne_impl(a, b):
 
 
 def _lt_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -919,10 +906,7 @@ def _lt_impl(a, b):
 
 
 def _le_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -935,10 +919,7 @@ def _le_impl(a, b):
 
 
 def _gt_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -951,10 +932,7 @@ def _gt_impl(a, b):
 
 
 def _ge_impl(a, b):
-    if a.length != b.length:
-        raise ValueError("Arrow arrays must have the same length")
-    out = np.empty(a.length, dtype=np.bool_)
-    mask = np.empty(a.length, dtype=np.bool_)
+    out, mask = _compare_outputs(a.length, b.length)
     a_null = a.null_count != 0
     b_null = b.null_count != 0
     a_data = a.data
@@ -966,9 +944,9 @@ def _ge_impl(a, b):
     return out, mask
 
 
-# The ten bodies below are written out, not factored: a helper taking the
-# struct makes Numba refcount its two arrays per element (22 ms vs 1.1 ms
-# per 1M additions).
+# The ten loops below stay written out: a helper called per element makes
+# Numba refcount the struct's two arrays every time (22 ms vs 1.1 ms per 1M
+# additions). Only the length check and the allocation are shared.
 _NUMERIC = types.integer_domain | types.real_domain
 _REAL = types.real_domain
 
