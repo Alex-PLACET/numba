@@ -416,7 +416,8 @@ class _Exported:
         self.array.private_data = ctypes.c_void_p(key)
         _EXPORTED[key] = self
 
-    def _release_array(self, ptr: Any, _registry: dict = _EXPORTED) -> None:
+    def _release_array(self, ptr: Any,
+                       _registry: dict[int, _Exported] = _EXPORTED) -> None:
         struct = ptr.contents
         struct.release = None
         _registry.pop(struct.private_data, None)
@@ -767,13 +768,17 @@ def _box_arrow_string(typ: ArrowStringType, val: Any, c: Any) -> Any:
 
 
 @overload(len)
-def _ol_len_string(arr):
+def _ol_len_string(arr: Any) -> Any:
     if isinstance(arr, ArrowStringType):
-        return lambda arr: arr.length
+        def impl(arr: Any) -> Any:
+            return arr.length
+        return impl
 
 
+# Numba compares a typing function's signature with its implementation's and
+# rejects mismatches, so @overload factories and their impls stay unannotated.
 @overload(operator.getitem)
-def _ol_getitem_string(arr, index):
+def _ol_getitem_string(arr: Any, index: Any) -> Any:
     """Return the byte bounds of element *index* as ``(start, end)``.
 
     A slice of ``arr.chars`` per element would allocate an array view per row:
@@ -786,7 +791,7 @@ def _ol_getitem_string(arr, index):
     if not isinstance(index, types.Integer):
         return None
 
-    def impl(arr, index):
+    def impl(arr: Any, index: Any) -> Any:
         offsets = arr.offsets
         length = arr.length
         i = index if index >= 0 else index + length
@@ -815,23 +820,31 @@ def _box_arrow_array(typ: ArrowArrayType, val: Any, c: Any) -> Any:
 
 
 @overload(len)
-def _ol_len(arr):
+def _ol_len(arr: Any) -> Any:
     if isinstance(arr, ArrowArrayType):
-        return lambda arr: arr.length
+        def impl(arr: Any) -> Any:
+            return arr.length
+        return impl
 
 
 @overload(operator.getitem)
-def _ol_getitem(arr, index):
+def _ol_getitem(arr: Any, index: Any) -> Any:
     if not isinstance(arr, ArrowArrayType):
         return None
     if not isinstance(index, types.Integer):
         return None
     if arr.nullable:
-        return lambda arr, index: _get_or_none(arr, index)
-    return lambda arr, index: arr.data[index]
+        def impl_nullable(arr: Any, index: Any) -> Any:
+            return _get_or_none(arr, index)  # pyrefly: ignore[missing-argument]
+        return impl_nullable
+
+    def impl_dense(arr: Any, index: Any) -> Any:
+        return arr.data[index]
+    return impl_dense
 
 
-def _index_to_intp(context, builder, index_val, index_type):
+def _index_to_intp(context: Any, builder: Any, index_val: Any,
+                   index_type: Any) -> Any:
     intp = context.get_value_type(types.intp)
     if index_val.type.width == intp.width:
         return index_val
@@ -840,7 +853,8 @@ def _index_to_intp(context, builder, index_val, index_type):
     return builder.zext(index_val, intp)
 
 
-def _check_bounds(context, builder, proxy, idx):
+def _check_bounds(context: Any, builder: Any, proxy: Any,
+                  idx: Any) -> Any:
     zero = ir.Constant(idx.type, 0)
     idx = builder.select(
         builder.icmp_signed("<", idx, zero),
@@ -855,7 +869,8 @@ def _check_bounds(context, builder, proxy, idx):
     return idx
 
 
-def _validity_bit(context, builder, proxy, idx):
+def _validity_bit(context: Any, builder: Any, proxy: Any,
+                  idx: Any) -> Any:
     bitmap = context.make_array(types.Array(types.uint8, 1, "C"))(
         context, builder, value=proxy.valid)
     bit = builder.add(proxy.offset, idx)
@@ -872,7 +887,7 @@ def _validity_bit(context, builder, proxy, idx):
 
 
 @intrinsic
-def is_valid(typingctx, arr, index):
+def is_valid(typingctx: Any, arr: Any, index: Any) -> Any:
     """Return True if element *index* of an Arrow array is not null."""
     if not isinstance(arr, (ArrowArrayType, ArrowStringType)):
         return None
@@ -880,7 +895,8 @@ def is_valid(typingctx, arr, index):
         return None
     sig = types.boolean(arr, index)
 
-    def codegen(context, builder, signature, args):
+    def codegen(context: Any, builder: Any, signature: Any,
+                args: Any) -> Any:
         arr_val, index_val = args
         proxy = cgutils.create_struct_proxy(signature.args[0])(
             context, builder, value=arr_val)
@@ -903,14 +919,15 @@ def is_valid(typingctx, arr, index):
 
 
 @intrinsic
-def _get_or_none(typingctx, arr, index):
+def _get_or_none(typingctx: Any, arr: Any, index: Any) -> Any:
     if not isinstance(arr, ArrowArrayType) or not arr.nullable:
         return None
     if not isinstance(index, types.Integer):
         return None
     sig = types.Optional(arr.dtype)(arr, index)
 
-    def codegen(context, builder, signature, args):
+    def codegen(context: Any, builder: Any, signature: Any,
+                args: Any) -> Any:
         arr_val, index_val = args
         arr_type = signature.args[0]
         proxy = cgutils.create_struct_proxy(arr_type)(
@@ -932,7 +949,7 @@ def _get_or_none(typingctx, arr, index):
 
 
 @register_jitable
-def _sum_loop(data, total):
+def _sum_loop(data: Any, total: Any) -> Any:
     for i in range(len(data)):
         total += data[i]
     return total
@@ -942,12 +959,13 @@ _FULL_WORD = np.uint64(0xFFFFFFFFFFFFFFFF)
 
 
 @intrinsic
-def _cttz64(typingctx, x):
+def _cttz64(typingctx: Any, x: Any) -> Any:
     if x != types.uint64:
         return None
     sig = types.uint64(x)
 
-    def codegen(context, builder, signature, args):
+    def codegen(context: Any, builder: Any, signature: Any,
+                args: Any) -> Any:
         decl = cgutils.get_or_insert_function(
             builder.module,
             ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(1)]),
@@ -959,14 +977,15 @@ def _cttz64(typingctx, x):
 
 
 @register_jitable
-def _flush_run(total, data, start, end):
+def _flush_run(total: Any, data: Any, start: int, end: int) -> Any:
     if start >= 0 and end > start:
         total += data[start:end].sum()
     return total
 
 
 @register_jitable
-def _runs_total(data, valid, offset, length, total):
+def _runs_total(data: Any, valid: Any, offset: int, length: int,
+                total: Any) -> Any:
     nbytes = len(valid)
     nfull = nbytes >> 3
     run_start = -1
@@ -978,9 +997,9 @@ def _runs_total(data, valid, offset, length, total):
             x = words[w]
             pos = 0
             while x:
-                start = _cttz64(x & -x)
+                start = _cttz64(x & -x)  # pyrefly: ignore[missing-argument]
                 y = (x >> start) & _FULL_WORD
-                run = _cttz64(~y & _FULL_WORD)
+                run = _cttz64(~y & _FULL_WORD)  # pyrefly: ignore
                 lo = word_base + pos + start
                 hi = lo + run
                 if lo < 0:
@@ -1019,20 +1038,20 @@ def _runs_total(data, valid, offset, length, total):
     return _flush_run(total, data, run_start, run_end)
 
 
-def _sum_signed_impl(arr):
+def _sum_signed_impl(arr: Any) -> Any:
     if arr.null_count == 0:
         return _sum_loop(arr.data, 0)
     return _runs_total(arr.data, arr.valid, arr.offset, arr.length, 0)
 
 
-def _sum_unsigned_impl(arr):
+def _sum_unsigned_impl(arr: Any) -> Any:
     if arr.null_count == 0:
         return _sum_loop(arr.data, np.uint64(0))
     return _runs_total(arr.data, arr.valid, arr.offset, arr.length,
                        np.uint64(0))
 
 
-def _sum_float_impl(arr):
+def _sum_float_impl(arr: Any) -> Any:
     if arr.null_count == 0:
         return _sum_loop(arr.data, 0.0)
     return _runs_total(arr.data, arr.valid, arr.offset, arr.length, 0.0)
@@ -1040,7 +1059,7 @@ def _sum_float_impl(arr):
 
 # min and max differ only in the comparison. A shared body with a literal
 # flag measured 4-5% slower at 1M, so the two stay written out.
-def _min_impl(arr):
+def _min_impl(arr: Any) -> Any:
     data = arr.data
     length = arr.length
     if length == 0:
@@ -1069,7 +1088,7 @@ def _min_impl(arr):
     return best
 
 
-def _max_impl(arr):
+def _max_impl(arr: Any) -> Any:
     data = arr.data
     length = arr.length
     if length == 0:
@@ -1099,7 +1118,7 @@ def _max_impl(arr):
 
 
 @overload_method(ArrowArrayType, "sum")
-def _ol_sum_method(arr):
+def _ol_sum_method(arr: Any) -> Any:
     if isinstance(arr.dtype, types.Float):
         return _sum_float_impl
     if isinstance(arr.dtype, types.Integer):
@@ -1110,11 +1129,11 @@ def _ol_sum_method(arr):
 
 
 @overload_method(ArrowArrayType, "min")
-def _ol_min_method(arr):
+def _ol_min_method(arr: Any) -> Any:
     return _min_impl
 
 
-def _min_max_impl(arr):
+def _min_max_impl(arr: Any) -> Any:
     data = arr.data
     length = arr.length
     if length == 0:
@@ -1155,23 +1174,24 @@ def _min_max_impl(arr):
 
 
 @overload_method(ArrowArrayType, "min_max")
-def _ol_min_max_method(arr):
+def _ol_min_max_method(arr: Any) -> Any:
     return _min_max_impl
 
 
 @overload_method(ArrowArrayType, "max")
-def _ol_max_method(arr):
+def _ol_max_method(arr: Any) -> Any:
     return _max_impl
 
 
 @register_jitable
-def _check_lengths(a_length, b_length):
+def _check_lengths(a_length: int, b_length: int) -> None:
     if a_length != b_length:
         raise ValueError("Arrow arrays must have the same length")
 
 
 @register_jitable
-def _clear_nulls(mask, valid, offset, length):
+def _clear_nulls(mask: Any, valid: Any, offset: int,
+                 length: int) -> None:
     for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         if byte != 0xFF:
@@ -1183,7 +1203,7 @@ def _clear_nulls(mask, valid, offset, length):
 
 
 @register_jitable
-def _binary_mask(a, b):
+def _binary_mask(a: Any, b: Any) -> Any:
     mask = np.ones(a.length, np.bool_)
     if a.null_count != 0:
         _clear_nulls(mask, a.valid, a.offset, a.length)
@@ -1192,7 +1212,7 @@ def _binary_mask(a, b):
     return mask
 
 
-def _add_impl(a, b):
+def _add_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1202,7 +1222,7 @@ def _add_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _sub_impl(a, b):
+def _sub_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1212,7 +1232,7 @@ def _sub_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _mul_impl(a, b):
+def _mul_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1222,7 +1242,7 @@ def _mul_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _truediv_impl(a, b):
+def _truediv_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1234,7 +1254,7 @@ def _truediv_impl(a, b):
     return out, mask
 
 
-def _eq_impl(a, b):
+def _eq_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1244,7 +1264,7 @@ def _eq_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _ne_impl(a, b):
+def _ne_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1254,7 +1274,7 @@ def _ne_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _lt_impl(a, b):
+def _lt_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1264,7 +1284,7 @@ def _lt_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _le_impl(a, b):
+def _le_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1274,7 +1294,7 @@ def _le_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _gt_impl(a, b):
+def _gt_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1284,7 +1304,7 @@ def _gt_impl(a, b):
     return out, _binary_mask(a, b)
 
 
-def _ge_impl(a, b):
+def _ge_impl(a: Any, b: Any) -> Any:
     _check_lengths(a.length, b.length)
     a_data = a.data
     b_data = b.data
@@ -1304,9 +1324,9 @@ _NUMERIC = types.integer_domain | types.real_domain
 _REAL = types.real_domain
 
 
-def _register_binary(op, impl, allowed):
+def _register_binary(op: Any, impl: Any, allowed: Any) -> None:
     @overload(op)
-    def _typing(a, b):
+    def _typing(a: Any, b: Any) -> Any:
         if not (isinstance(a, ArrowArrayType)
                 and isinstance(b, ArrowArrayType)):
             return None
