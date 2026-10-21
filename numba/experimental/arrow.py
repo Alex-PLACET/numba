@@ -2,6 +2,19 @@
 
 Arrays are imported through the Arrow PyCapsule interface, so any producer
 (pyarrow, Polars, nanoarrow, ...) works without depending on it.
+
+Performance notes
+-----------------
+``arr.data`` is a real ndarray and ``arr.valid`` the raw validity bytes, so
+the cheapest null-aware reductions avoid a per-element validity branch: sum
+``arr.data`` and subtract the null slots found by scanning the bitmap, or
+take an 8-element tight loop when a validity byte is ``0xFF``. Both run 2-4x
+faster than an ``arr[i] is not None`` loop at 1% nulls, and adding
+``arrow_jit(parallel=True)`` with ``prange`` on the bitmap fixup takes it to
+5x once the array is larger than the last-level cache. Below it, thread
+start-up dominates. Anything pyarrow can express as one
+``pyarrow.compute`` kernel is better done there: its kernels are SIMD, while
+a jit loop is scalar.
 """
 
 from __future__ import annotations

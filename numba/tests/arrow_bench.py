@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 import polars as pl
 
 from numba import jit, njit
-from numba.experimental.arrow import arrow_jit
+from numba.experimental.arrow import arrow_jit, from_arrow
 
 N = 1_000_000
 REPEATS = 7
@@ -61,6 +61,46 @@ def _sum_arrow_masked(arr):
     return total
 
 
+def _sum_byte_aware(arr):
+    total = 0
+    data = arr.data
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        if byte == 0xFF:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length:
+                    total += data[i]
+        else:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and (byte >> k) & 1:
+                    total += data[i]
+    return total
+
+
+def _sum_two_pass(arr):
+    total = np.sum(arr.data)
+    if arr.null_count == 0:
+        return total
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        if byte != 0xFF:
+            base = b * 8 - offset
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and not (byte >> k) & 1:
+                    total -= arr.data[i]
+    return total
+
+
 def _build(n):
     out = np.empty(n, dtype=np.int64)
     for i in range(n):
@@ -83,10 +123,13 @@ _jit_build = jit(_build)
 _njit_build = njit(_build)
 _jit_fill = jit(_fill)
 _njit_fill = njit(_fill)
+_byte_aware_sum = arrow_jit(_sum_byte_aware)
+_two_pass_sum = arrow_jit(_sum_two_pass)
+_parallel_sum = arrow_jit(_sum_two_pass, parallel=True)
 
 
-def _report(title, rows, note=None):
-    print(f"\n{title}  ({N} int64, best of {REPEATS})")
+def _report(title, rows, note=None, n=N):
+    print(f"\n{title}  ({n} int64, best of {REPEATS})")
     if note is not None:
         print(f"  {note}")
     for name, seconds in rows:
@@ -94,7 +137,7 @@ def _report(title, rows, note=None):
             print(f"  {name:26s}{'n/a':>12s}")
         else:
             print(f"  {name:26s}{seconds * 1e3:8.3f} ms"
-                  f"{N / seconds / 1e9:8.2f} Gelem/s")
+                  f"{n / seconds / 1e9:8.2f} Gelem/s")
 
 
 def main():
@@ -166,6 +209,28 @@ def main():
         ("pyarrow", None),
         ("polars", None),
     ], note="Arrow arrays and Polars Series are immutable; no in-place build")
+
+    big = 4 * N
+    big_values = np.arange(big, dtype=np.int64)
+    big_mask = (np.arange(big) % 100) != 0
+    big_arrow = pa.array(big_values, mask=~big_mask)
+    big_view = from_arrow(big_arrow)
+    expected_big = int(big_values[big_mask].sum())
+    assert _arrow_sum_masked(big_view) == expected_big
+    assert _byte_aware_sum(big_view) == expected_big
+    assert _two_pass_sum(big_view) == expected_big
+    assert _parallel_sum(big_view) == expected_big
+    _report("sum, 1% nulls, out of cache", [
+        ("arr[i] is not None loop",
+         _fastest(lambda: _arrow_sum_masked(big_view))),
+        ("byte-aware bitmap loop",
+         _fastest(lambda: _byte_aware_sum(big_view))),
+        ("two-pass bitmap fixup",
+         _fastest(lambda: _two_pass_sum(big_view))),
+        ("parallel two-pass",
+         _fastest(lambda: _parallel_sum(big_view))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(big_arrow))),
+    ], note="4M elements (32 MB) against a 24 MB L3", n=big)
 
 
 if __name__ == "__main__":
