@@ -624,3 +624,17 @@ class TestArrowNoBitmap(unittest.TestCase):
             return arr.sum(), arr.min_max()
 
         self.assertEqual(stats(pa.array([4, 2, 9])), (15, (2, 9)))
+
+    def test_reductions_deep_slice(self):
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min_max()
+
+        n = 10_000
+        values = np.arange(n, dtype=np.int64)
+        mask = (np.arange(n) % 7) != 0
+        arr = pa.array(values, mask=~mask).slice(n // 2)
+        expected = values[n // 2:][mask[n // 2:]]
+        self.assertEqual(stats(from_arrow(arr)),
+                         (int(expected.sum()),
+                          (int(expected.min()), int(expected.max()))))

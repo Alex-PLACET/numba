@@ -31,9 +31,14 @@ return a ``(values, mask)`` pair: ``values`` is a fresh ndarray, ``mask`` a
 bool ndarray that is False wherever either input was null, and the slots
 under a False are undefined. The results are plain ndarrays, not Arrow
 arrays: boxing a new Arrow array would need an allocator and a release
-callback, which is out of scope here. Materialising costs 1.2-1.7x what
+callback, which is out of scope here. Materialising costs 1.1-2x what
 ``pyarrow.compute`` takes for the same operation, so use it to compose jit
 code, not to replace ``pc.add``.
+
+``min``/``max``/``min_max`` do not special-case NaN: a NaN that is the first
+valid element wins, and any later one is ignored by the comparison. numpy
+propagates NaN and ``pyarrow.compute`` skips it, so neither matches here.
+Integers and temporals are unaffected.
 """
 
 from __future__ import annotations
@@ -597,7 +602,7 @@ def _sum_signed_impl(arr):
     valid = arr.valid
     offset = arr.offset
     length = arr.length
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         if byte != 0xFF:
             base = b * 8 - offset
@@ -618,7 +623,7 @@ def _sum_unsigned_impl(arr):
     valid = arr.valid
     offset = arr.offset
     length = arr.length
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         if byte != 0xFF:
             base = b * 8 - offset
@@ -639,7 +644,7 @@ def _sum_float_impl(arr):
     valid = arr.valid
     offset = arr.offset
     length = arr.length
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         base = b * 8 - offset
         if byte == 0xFF:
@@ -669,7 +674,7 @@ def _min_impl(arr):
     valid = arr.valid
     offset = arr.offset
     found = False
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         base = b * 8 - offset
         for k in range(8):
@@ -697,7 +702,7 @@ def _max_impl(arr):
     valid = arr.valid
     offset = arr.offset
     found = False
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         base = b * 8 - offset
         for k in range(8):
@@ -745,7 +750,7 @@ def _min_max_impl(arr):
     valid = arr.valid
     offset = arr.offset
     found = False
-    for b in range((offset + length + 7) // 8):
+    for b in range(offset >> 3, (offset + length + 7) >> 3):
         byte = valid[b]
         base = b * 8 - offset
         for k in range(8):
@@ -834,9 +839,10 @@ def _truediv_impl(a, b):
     a_data = a.data
     b_data = b.data
     for i in range(a.length):
-        mask[i] = ((not a_null or is_valid(a, i))
-                   and (not b_null or is_valid(b, i)))
-        if mask[i]:
+        ok = ((not a_null or is_valid(a, i))
+              and (not b_null or is_valid(b, i)))
+        mask[i] = ok
+        if ok:
             out[i] = a_data[i] / b_data[i]
     return out, mask
 
@@ -937,6 +943,9 @@ def _ge_impl(a, b):
     return out, mask
 
 
+# The ten bodies below are written out, not factored: a helper taking the
+# struct makes Numba refcount its two arrays per element (22 ms vs 1.1 ms
+# per 1M additions).
 _NUMERIC = types.integer_domain | types.real_domain
 _REAL = types.real_domain
 
