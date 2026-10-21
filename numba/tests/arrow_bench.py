@@ -10,9 +10,9 @@ Run with::
 import time
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
-import polars as pl
 
 from numba import jit, njit
 from numba.experimental.arrow import arrow_jit, from_arrow, is_valid

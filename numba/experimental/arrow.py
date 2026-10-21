@@ -51,7 +51,8 @@ from __future__ import annotations
 
 import ctypes
 import operator
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import numpy as np
 from llvmlite import ir
@@ -199,7 +200,7 @@ def _release_struct(struct: ctypes.Structure,
 class _Owner:
     """Releases the imported Arrow structs when the last view dies."""
 
-    __slots__ = ("schema", "array")
+    __slots__ = ("array", "schema")
 
     schema: _ArrowSchema
     array: _ArrowArray
@@ -234,8 +235,8 @@ def _dtype_from_format(fmt: str) -> np.dtype:
 
 
 def _buffer(ptr: int, nbytes: int, owner: _Owner) -> ctypes.Array:
-    buf = (ctypes.c_ubyte * nbytes).from_address(ptr)
-    setattr(buf, "_owner", owner)
+    buf: Any = (ctypes.c_ubyte * nbytes).from_address(ptr)
+    buf._owner = owner
     return buf
 
 
