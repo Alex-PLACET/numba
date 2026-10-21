@@ -1,0 +1,592 @@
+import ctypes
+import gc
+import unittest
+
+import numpy as np
+
+from numba import jit, typeof, types
+from numba.experimental.arrow import (
+    ArrowArrayView,
+    arrow_jit,
+    from_arrow,
+    is_valid,
+)
+
+try:
+    import pyarrow as pa
+except ImportError:
+    pa = None
+
+try:
+    import polars as pl
+except ImportError:
+    pl = None
+
+requires_pyarrow = unittest.skipIf(pa is None, "pyarrow is not installed")
+requires_polars = unittest.skipIf(pl is None, "polars is not installed")
+
+
+@requires_pyarrow
+class TestArrowImport(unittest.TestCase):
+    def test_int64_zero_copy(self):
+        src = pa.array([1, 2, 3, 4])
+        view = from_arrow(src)
+        self.assertIsInstance(view, ArrowArrayView)
+        self.assertEqual(view.dtype, np.dtype("int64"))
+        self.assertEqual(len(view), 4)
+        self.assertEqual(view[2], 3)
+        self.assertEqual(view.null_count, 0)
+        self.assertEqual(view.offset, 0)
+        self.assertEqual(view.data.ctypes.data, src.buffers()[1].address)
+
+    def test_float64_values(self):
+        view = from_arrow(pa.array([1.5, 2.5]))
+        self.assertEqual(view.dtype, np.dtype("float64"))
+        np.testing.assert_array_equal(view.data, [1.5, 2.5])
+
+    def test_dtypes(self):
+        cases = [
+            (pa.array([1], type=pa.int8()), "int8"),
+            (pa.array([1], type=pa.uint8()), "uint8"),
+            (pa.array([1], type=pa.int16()), "int16"),
+            (pa.array([1], type=pa.uint16()), "uint16"),
+            (pa.array([1], type=pa.int32()), "int32"),
+            (pa.array([1], type=pa.uint32()), "uint32"),
+            (pa.array([1], type=pa.int64()), "int64"),
+            (pa.array([1], type=pa.uint64()), "uint64"),
+            (pa.array([1.0], type=pa.float32()), "float32"),
+            (pa.array([1.0], type=pa.float64()), "float64"),
+            (pa.array([1], type=pa.date32()), "datetime64[D]"),
+            (pa.array([1], type=pa.timestamp("us")), "datetime64[us]"),
+            (pa.array([1], type=pa.timestamp("ns", tz="UTC")),
+             "datetime64[ns]"),
+            (pa.array([1], type=pa.duration("ns")), "timedelta64[ns]"),
+        ]
+        for src, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(from_arrow(src).dtype, np.dtype(expected))
+
+    def test_nulls(self):
+        view = from_arrow(pa.array([1.0, None, 3.0]))
+        self.assertEqual(view.null_count, 1)
+        self.assertEqual(view.valid.dtype, np.dtype("uint8"))
+        self.assertEqual(view.data[2], 3.0)
+
+    def test_sliced_with_offset(self):
+        view = from_arrow(pa.array([1, None, 3, None, 5])[1:])
+        self.assertEqual(view.offset, 1)
+        self.assertEqual(len(view), 4)
+        self.assertEqual(view.data[1], 3)
+        self.assertEqual(view.data[3], 5)
+        self.assertEqual(view.null_count, 2)
+
+    def test_empty(self):
+        view = from_arrow(pa.array([], type=pa.int64()))
+        self.assertEqual(len(view), 0)
+        self.assertEqual(view.data.shape, (0,))
+
+    def test_bool_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.array([True, False]))
+        self.assertIn("bit-packed", str(cm.exception))
+
+    def test_string_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.array(["a", "b"]))
+        self.assertIn("unsupported Arrow format", str(cm.exception))
+
+    def test_dictionary_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.array(["a", "b"]).dictionary_encode())
+        self.assertIn("dictionary", str(cm.exception))
+
+    def test_nested_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.array([[1, 2], [3]]))
+        self.assertIn("nested", str(cm.exception))
+
+
+@requires_pyarrow
+class TestArrowStream(unittest.TestCase):
+    def test_single_chunk(self):
+        view = from_arrow(pa.chunked_array([[1, 2, 3]]))
+        self.assertEqual(len(view), 3)
+        self.assertEqual(view.dtype, np.dtype("int64"))
+        np.testing.assert_array_equal(view.data, [1, 2, 3])
+
+    def test_multiple_chunks_rejected(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(pa.chunked_array([[1, 2], [3]]))
+        self.assertIn("chunk", str(cm.exception))
+
+    def test_not_exportable(self):
+        with self.assertRaises(TypeError) as cm:
+            from_arrow([1, 2, 3])
+        self.assertIn("__arrow_c_array__", str(cm.exception))
+
+
+@requires_polars
+class TestPolarsImport(unittest.TestCase):
+    def test_series(self):
+        view = from_arrow(pl.Series("a", [1, 2, 3]))
+        self.assertEqual(view.dtype, np.dtype("int64"))
+        np.testing.assert_array_equal(view.data, [1, 2, 3])
+
+    def test_series_float_with_null(self):
+        view = from_arrow(pl.Series("a", [1.0, None, 3.0]))
+        self.assertEqual(view.null_count, 1)
+        self.assertEqual(view.data[2], 3.0)
+
+
+@requires_pyarrow
+class TestNumbaArrow(unittest.TestCase):
+    def test_typeof(self):
+        from numba.experimental.arrow import ArrowArrayType
+
+        ty = typeof(from_arrow(pa.array([1, 2])))
+        self.assertIsInstance(ty, ArrowArrayType)
+        self.assertEqual(ty.dtype, types.int64)
+        self.assertEqual(ty, ArrowArrayType(types.int64))
+
+    def test_len_and_getitem(self):
+        @jit
+        def f(arr):
+            return len(arr), arr[1], arr[-1]
+
+        self.assertEqual(f(from_arrow(pa.array([10, 20, 30]))), (3, 20, 30))
+
+    def test_data_attribute(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(f(from_arrow(pa.array([1.0, 2.0, 3.0]))), 6.0)
+
+    def test_loop_sum(self):
+        @jit
+        def f(arr):
+            total = 0
+            for i in range(len(arr)):
+                total += arr[i]
+            return total
+
+        self.assertEqual(f(from_arrow(pa.array([1, 2, 3, 4]))), 10)
+
+    def test_repeated_calls(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        for _ in range(200):
+            self.assertEqual(f(from_arrow(pa.array([1, 2]))), 3)
+
+    @requires_polars
+    def test_polars_series_in_jit(self):
+        @jit
+        def f(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(f(from_arrow(pl.Series("a", [1.0, 2.0]))), 3.0)
+
+    def test_is_valid(self):
+        view = from_arrow(pa.array([1.0, None, 3.0]))
+
+        @jit
+        def mask(arr):
+            return [is_valid(arr, i) for i in range(len(arr))]
+
+        self.assertEqual(mask(view), [True, False, True])
+
+    def test_sum_non_null(self):
+        @jit
+        def f(arr):
+            total = 0.0
+            for i in range(len(arr)):
+                if is_valid(arr, i):
+                    total += arr[i]
+            return total
+
+        self.assertEqual(f(from_arrow(pa.array([1.0, None, 3.0]))), 4.0)
+
+    def test_is_valid_negative_index(self):
+        @jit
+        def f(arr):
+            return is_valid(arr, -1)
+
+        self.assertTrue(f(from_arrow(pa.array([1, 2]))))
+        self.assertFalse(f(from_arrow(pa.array([1, None]))))
+
+    def test_is_valid_out_of_range(self):
+        @jit
+        def f(arr):
+            return is_valid(arr, 5)
+
+        with self.assertRaises(IndexError):
+            f(from_arrow(pa.array([1, 2])))
+
+    def test_nullable_getitem(self):
+        view = from_arrow(pa.array([1, None, 3]))
+
+        @jit
+        def f(arr, i):
+            return arr[i]
+
+        self.assertEqual(f(view, 0), 1)
+        self.assertIsNone(f(view, 1))
+        self.assertIsNone(view[1])
+        self.assertEqual(view[2], 3)
+
+    def test_nullable_getitem_guarded_by_is_valid(self):
+        producer = _Producer([1, 2, 3], null_count=1, valid_bytes=b"\x05")
+        view = from_arrow(producer)
+
+        @jit
+        def f(arr):
+            total = 0
+            for i in range(len(arr)):
+                if is_valid(arr, i):
+                    total += arr[i]
+            return total
+
+        self.assertEqual(f(view), 4)
+
+    def test_nullable_getitem_raises_when_unguarded(self):
+        producer = _Producer([1, 2, 3], null_count=1, valid_bytes=b"\x05")
+        view = from_arrow(producer)
+
+        @jit
+        def f(arr):
+            return arr[1] + 1
+
+        with self.assertRaises(TypeError) as cm:
+            f(view)
+        self.assertIn("got None", str(cm.exception))
+
+
+from numba.experimental.arrow import _ArrowArray, _ArrowSchema  # noqa: E402
+
+_ArrayRelease = ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowArray))
+
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+_PyCapsule_New.restype = ctypes.py_object
+
+
+class _Producer:
+    """Minimal ArrowArray producer used to observe the release callback.
+
+    It owns the value buffer and the release callback, so it must outlive
+    any view created from it.
+    """
+
+    def __init__(self, values, null_count=0, valid_bytes=None):
+        self.released = 0
+        self._values = (ctypes.c_int64 * len(values))(*values)
+        self._bitmap = None
+        if valid_bytes is not None:
+            self._bitmap = ctypes.create_string_buffer(valid_bytes)
+        self._buffers = (ctypes.c_void_p * 2)()
+        if self._bitmap is not None:
+            self._buffers[0] = ctypes.cast(self._bitmap, ctypes.c_void_p)
+        self._buffers[1] = ctypes.cast(self._values, ctypes.c_void_p)
+        self._format = ctypes.create_string_buffer(b"l")
+        self._callback = _ArrayRelease(self._on_release)
+        self._array = _ArrowArray(
+            length=len(values), null_count=null_count, offset=0, n_buffers=2,
+            n_children=0, buffers=self._buffers, children=None,
+            dictionary=None,
+            release=ctypes.cast(self._callback, ctypes.c_void_p),
+            private_data=None)
+        self._schema = _ArrowSchema(
+            format=ctypes.cast(self._format, ctypes.c_char_p), name=None,
+            metadata=None, flags=0, n_children=0, children=None,
+            dictionary=None, release=None, private_data=None)
+
+    def _on_release(self, ptr):
+        self.released += 1
+
+    def __arrow_c_array__(self, requested_schema=None):
+        schema = _PyCapsule_New(
+            ctypes.addressof(self._schema), b"arrow_schema", None)
+        array = _PyCapsule_New(
+            ctypes.addressof(self._array), b"arrow_array", None)
+        return schema, array
+
+
+class TestOwnership(unittest.TestCase):
+    def test_bad_capsule_name(self):
+        class Fake:
+            def __arrow_c_array__(self, requested_schema=None):
+                return object(), object()
+
+        with self.assertRaises(TypeError) as cm:
+            from_arrow(Fake())
+        self.assertIn("arrow_schema", str(cm.exception))
+
+    def test_release_on_gc(self):
+        producer = _Producer([1, 2, 3])
+        view = from_arrow(producer)
+        self.assertEqual(view.data.tolist(), [1, 2, 3])
+        self.assertEqual(producer.released, 0)
+        del view
+        gc.collect()
+        self.assertEqual(producer.released, 1)
+
+    def test_arrays_keep_owner_alive(self):
+        producer = _Producer([1, 2, 3])
+        data = from_arrow(producer).data
+        gc.collect()
+        self.assertEqual(producer.released, 0)
+        self.assertEqual(data.tolist(), [1, 2, 3])
+        del data
+        gc.collect()
+        self.assertEqual(producer.released, 1)
+
+    def test_unknown_null_count(self):
+        producer = _Producer([1, 2], null_count=-1, valid_bytes=b"\x01")
+        view = from_arrow(producer)
+        self.assertEqual(view.null_count, -1)
+
+        @jit
+        def mask(arr):
+            return [is_valid(arr, i) for i in range(len(arr))]
+
+        self.assertEqual(mask(view), [True, False])
+
+
+@requires_pyarrow
+class TestArrowJit(unittest.TestCase):
+    def test_pyarrow_array(self):
+        @arrow_jit
+        def total(arr):
+            acc = 0
+            for i in range(len(arr)):
+                acc += arr[i]
+            return acc
+
+        self.assertEqual(total(pa.array([1, 2, 3])), 6)
+
+    @requires_polars
+    def test_polars_series(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(total(pl.Series("a", [1.0, 2.0])), 3.0)
+
+    def test_non_arrow_argument(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr)
+
+        self.assertEqual(total(np.array([1, 2, 3])), 6)
+
+    def test_jit_options(self):
+        @arrow_jit(nogil=True)
+        def total(arr):
+            return np.sum(arr.data)
+
+        self.assertEqual(total(pa.array([1, 2, 3])), 6)
+
+    def test_dispatcher_attributes(self):
+        @arrow_jit
+        def total(arr):
+            return np.sum(arr.data)
+
+        total(pa.array([1]))
+        self.assertEqual(len(total.signatures), 1)
+        self.assertEqual(total.py_func(from_arrow(pa.array([1, 2]))), 3)
+
+
+@requires_pyarrow
+class TestArrowReductions(unittest.TestCase):
+    def test_sum_dense(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([1, 2, 3, 4]))), 10)
+
+    def test_sum_skips_nulls(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([1, 2, None, 4]))), 7)
+
+    def test_sum_all_null(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(total(from_arrow(src)), 0)
+
+    def test_sum_empty(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([], type=pa.int64()))), 0)
+
+    def test_sum_widens_int8(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([100, 100, 100], type=pa.int8())
+        self.assertEqual(total(from_arrow(src)), 300)
+
+    def test_sum_uint64(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([1, 2, None, 3], type=pa.uint64())
+        self.assertEqual(total(from_arrow(src)), 6)
+
+    def test_sum_float(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertAlmostEqual(total(from_arrow(pa.array([0.5, None, 2.5]))),
+                               3.0)
+
+    def test_min_max_nulls(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, None, 9, 1]))),
+                         (1, 9))
+
+    def test_min_max_dense(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, 9, 1]))), (1, 9))
+
+    def test_min_max_all_null(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+    def test_min_max_empty(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        src = pa.array([], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+    def test_reductions_sliced(self):
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min(), arr.max()
+
+        src = pa.array([1, None, 3, 4, 5, None, 7]).slice(2)
+        self.assertEqual(stats(from_arrow(src)), (19, 3, 7))
+
+    def test_matches_pyarrow_compute(self):
+        import pyarrow.compute as pc
+
+        rng = np.random.default_rng(7)
+        values = rng.integers(-1000, 1000, 1000).astype(np.int64)
+        mask = rng.random(1000) < 0.1
+        src = pa.array(values, mask=mask)
+
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min(), arr.max()
+
+        self.assertEqual(stats(from_arrow(src)),
+                         (int(pc.sum(src).as_py()),
+                          pc.min(src).as_py(),
+                          pc.max(src).as_py()))
+
+    def test_min_max_pair(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min_max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, None, 9, 1]))),
+                         (1, 9))
+        self.assertEqual(bounds(from_arrow(pa.array([3, 9, 1]))), (1, 9))
+
+    def test_min_max_pair_all_null(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min_max()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+
+@requires_pyarrow
+class TestArrowElementwise(unittest.TestCase):
+    def test_add_propagates_nulls(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        a = from_arrow(pa.array([1, None, 3]))
+        b = from_arrow(pa.array([10, 20, None]))
+        values, mask = add(a, b)
+        self.assertEqual(list(mask), [True, False, False])
+        self.assertEqual(values[0], 11)
+
+    def test_add_dense(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        values, mask = add(from_arrow(pa.array([1, 2, 3])),
+                           from_arrow(pa.array([10, 20, 30])))
+        np.testing.assert_array_equal(values, [11, 22, 33])
+        self.assertTrue(mask.all())
+
+    def test_sub_and_mul(self):
+        @arrow_jit
+        def ops(a, b):
+            return a - b, a * b
+
+        (diff, diff_mask), (prod, prod_mask) = ops(
+            from_arrow(pa.array([10, 20, None])),
+            from_arrow(pa.array([1, None, 3])))
+        self.assertEqual(diff[0], 9)
+        self.assertEqual(prod[0], 10)
+        self.assertEqual(list(diff_mask), [True, False, False])
+        self.assertEqual(list(prod_mask), [True, False, False])
+
+    def test_truediv_float(self):
+        @arrow_jit
+        def div(a, b):
+            return a / b
+
+        values, mask = div(from_arrow(pa.array([1.0, 2.0, None])),
+                           from_arrow(pa.array([2.0, None, 4.0])))
+        self.assertEqual(list(mask), [True, False, False])
+        self.assertEqual(values[0], 0.5)
+
+    def test_comparison(self):
+        @arrow_jit
+        def cmp(a, b):
+            return a > b
+
+        values, mask = cmp(from_arrow(pa.array([1, 5, None, 3])),
+                           from_arrow(pa.array([2, 2, 2, None])))
+        self.assertEqual(list(mask), [True, True, False, False])
+        self.assertEqual(list(values[mask]), [False, True])
+
+    def test_length_mismatch(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        with self.assertRaises(ValueError):
+            add(from_arrow(pa.array([1, 2])), from_arrow(pa.array([1])))

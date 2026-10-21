@@ -1,0 +1,306 @@
+"""Benchmarks: 1M int64 arrays through Numba, pyarrow and Polars.
+
+Cases: sum without nulls, sum with 1% nulls, build, build preallocated.
+
+Run with::
+
+    python -m numba.tests.arrow_bench
+"""
+
+import time
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import polars as pl
+
+from numba import jit, njit
+from numba.experimental.arrow import arrow_jit, from_arrow, is_valid
+
+N = 1_000_000
+REPEATS = 7
+
+
+def _fastest(call, repeats=REPEATS):
+    best = float("inf")
+    for _ in range(repeats):
+        start = time.perf_counter()
+        call()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def _sum_plain(a):
+    total = 0
+    for i in range(len(a)):
+        total += a[i]
+    return total
+
+
+def _sum_masked(a, mask):
+    total = 0
+    for i in range(len(a)):
+        if mask[i]:
+            total += a[i]
+    return total
+
+
+def _sum_arrow_plain(arr):
+    total = 0
+    for i in range(len(arr)):
+        total += arr[i]
+    return total
+
+
+def _sum_arrow_masked(arr):
+    total = 0
+    for i in range(len(arr)):
+        value = arr[i]
+        if value is not None:
+            total += value
+    return total
+
+
+def _sum_byte_aware(arr):
+    total = 0
+    data = arr.data
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        if byte == 0xFF:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length:
+                    total += data[i]
+        else:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and (byte >> k) & 1:
+                    total += data[i]
+    return total
+
+
+def _sum_two_pass(arr):
+    total = np.sum(arr.data)
+    if arr.null_count == 0:
+        return total
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        if byte != 0xFF:
+            base = b * 8 - offset
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and not (byte >> k) & 1:
+                    total -= arr.data[i]
+    return total
+
+
+def _op_sum(arr):
+    return arr.sum()
+
+
+def _op_min_max(arr):
+    return arr.min_max()
+
+
+def _op_add(a, b):
+    return a + b
+
+
+def _op_dot(a, b):
+    total = 0
+    for i in range(len(a)):
+        if is_valid(a, i) and is_valid(b, i):
+            total += a.data[i] * b.data[i]
+    return total
+
+
+def _op_count_gt(arr, threshold):
+    count = 0
+    for i in range(len(arr)):
+        if is_valid(arr, i) and arr.data[i] > threshold:
+            count += 1
+    return count
+
+
+def _build(n):
+    out = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        out[i] = i
+    return out
+
+
+def _fill(out):
+    for i in range(len(out)):
+        out[i] = i
+
+
+_jit_sum = jit(_sum_plain)
+_njit_sum = njit(_sum_plain)
+_jit_sum_masked = jit(_sum_masked)
+_njit_sum_masked = njit(_sum_masked)
+_arrow_sum = arrow_jit(_sum_arrow_plain)
+_arrow_sum_masked = arrow_jit(_sum_arrow_masked)
+_jit_build = jit(_build)
+_njit_build = njit(_build)
+_jit_fill = jit(_fill)
+_njit_fill = njit(_fill)
+_byte_aware_sum = arrow_jit(_sum_byte_aware)
+_two_pass_sum = arrow_jit(_sum_two_pass)
+_parallel_sum = arrow_jit(_sum_two_pass, parallel=True)
+_op_sum_jit = arrow_jit(_op_sum)
+_op_min_max_jit = arrow_jit(_op_min_max)
+_op_add_jit = arrow_jit(_op_add)
+_op_dot_jit = arrow_jit(_op_dot)
+_op_count_gt_jit = arrow_jit(_op_count_gt)
+
+
+def _report(title, rows, note=None, n=N):
+    print(f"\n{title}  ({n} int64, best of {REPEATS})")
+    if note is not None:
+        print(f"  {note}")
+    for name, seconds in rows:
+        if seconds is None:
+            print(f"  {name:26s}{'n/a':>12s}")
+        else:
+            print(f"  {name:26s}{seconds * 1e3:8.3f} ms"
+                  f"{n / seconds / 1e9:8.2f} Gelem/s")
+
+
+def main():
+    values = np.arange(N, dtype=np.int64)
+    mask = (np.arange(N) % 100) != 0
+    arrow_plain = pa.array(values)
+    arrow_masked = pa.array(values, mask=~mask)
+    series_plain = pl.Series(arrow_plain)
+    series_masked = pl.Series(arrow_masked)
+
+    expected = int(values[mask].sum())
+    assert _jit_sum_masked(values, mask) == expected
+    assert _njit_sum_masked(values, mask) == expected
+    assert _arrow_sum_masked(arrow_masked) == expected
+    assert _arrow_sum_masked(series_masked) == expected
+    assert pc.sum(arrow_masked).as_py() == expected
+    assert series_masked.sum() == expected
+
+    out = np.empty(N, dtype=np.int64)
+    _jit_sum(values)
+    _njit_sum(values)
+    _jit_sum_masked(values, mask)
+    _njit_sum_masked(values, mask)
+    _arrow_sum(arrow_plain)
+    _arrow_sum(series_plain)
+    _arrow_sum_masked(arrow_masked)
+    _arrow_sum_masked(series_masked)
+    pc.sum(arrow_plain)
+    pc.sum(arrow_masked)
+    series_plain.sum()
+    series_masked.sum()
+    _jit_build(N)
+    _njit_build(N)
+    _jit_fill(out)
+    _njit_fill(out)
+
+    _report("sum, no nulls", [
+        ("numpy @jit", _fastest(lambda: _jit_sum(values))),
+        ("numpy @njit", _fastest(lambda: _njit_sum(values))),
+        ("arrow @jit (pyarrow)", _fastest(lambda: _arrow_sum(arrow_plain))),
+        ("arrow @jit (polars)", _fastest(lambda: _arrow_sum(series_plain))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(arrow_plain))),
+        ("polars Series.sum", _fastest(lambda: series_plain.sum())),
+    ])
+
+    _report("sum, 1% nulls", [
+        ("numpy @jit", _fastest(lambda: _jit_sum_masked(values, mask))),
+        ("numpy @njit", _fastest(lambda: _njit_sum_masked(values, mask))),
+        ("arrow @jit (pyarrow)", _fastest(
+            lambda: _arrow_sum_masked(arrow_masked))),
+        ("arrow @jit (polars)", _fastest(
+            lambda: _arrow_sum_masked(series_masked))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(arrow_masked))),
+        ("polars Series.sum", _fastest(lambda: series_masked.sum())),
+    ])
+
+    _report("build", [
+        ("numpy @jit empty+fill", _fastest(lambda: _jit_build(N))),
+        ("numpy @njit empty+fill", _fastest(lambda: _njit_build(N))),
+        ("pyarrow pa.array(arange)", _fastest(
+            lambda: pa.array(np.arange(N, dtype=np.int64)))),
+        ("polars int_range", _fastest(
+            lambda: pl.int_range(0, N, eager=True))),
+    ], note="pyarrow/polars rows generate the values, as the numba rows do")
+
+    _report("build, preallocated", [
+        ("numpy @jit fill", _fastest(lambda: _jit_fill(out))),
+        ("numpy @njit fill", _fastest(lambda: _njit_fill(out))),
+        ("pyarrow", None),
+        ("polars", None),
+    ], note="Arrow arrays and Polars Series are immutable; no in-place build")
+
+    big = 4 * N
+    big_values = np.arange(big, dtype=np.int64)
+    big_mask = (np.arange(big) % 100) != 0
+    big_arrow = pa.array(big_values, mask=~big_mask)
+    big_view = from_arrow(big_arrow)
+    expected_big = int(big_values[big_mask].sum())
+    assert _arrow_sum_masked(big_view) == expected_big
+    assert _byte_aware_sum(big_view) == expected_big
+    assert _two_pass_sum(big_view) == expected_big
+    assert _parallel_sum(big_view) == expected_big
+    _report("sum, 1% nulls, out of cache", [
+        ("arr[i] is not None loop",
+         _fastest(lambda: _arrow_sum_masked(big_view))),
+        ("byte-aware bitmap loop",
+         _fastest(lambda: _byte_aware_sum(big_view))),
+        ("two-pass bitmap fixup",
+         _fastest(lambda: _two_pass_sum(big_view))),
+        ("parallel two-pass",
+         _fastest(lambda: _parallel_sum(big_view))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(big_arrow))),
+    ], note="4M elements (32 MB) against a 24 MB L3", n=big)
+
+    other = pa.array(N - 1 - np.arange(N), type=pa.int64(), mask=~mask)
+    expected_min = int(values[mask].min())
+    expected_max = int(values[mask].max())
+    assert _op_sum_jit(arrow_masked) == expected
+    assert _op_min_max_jit(arrow_masked) == (expected_min, expected_max)
+    added, valid = _op_add_jit(arrow_masked, other)
+    assert int(valid.sum()) == int(mask.sum())
+    assert added[1] == int(arrow_masked[1].as_py() + other[1].as_py())
+    assert _op_dot_jit(arrow_masked, other) == int(
+        pc.sum(pc.multiply(arrow_masked, other)).as_py())
+    assert _op_count_gt_jit(arrow_masked, 500_000) == int(
+        pc.sum(pc.greater(arrow_masked, 500_000)).as_py())
+    _op_sum_jit(arrow_masked)
+    _op_min_max_jit(arrow_masked)
+    _op_dot_jit(arrow_masked, other)
+    _op_count_gt_jit(arrow_masked, 500_000)
+    _op_add_jit(arrow_masked, other)
+    _report("operations on the Arrow type", [
+        ("arr.sum()", _fastest(lambda: _op_sum_jit(arrow_masked))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(arrow_masked))),
+        ("arr.min_max()", _fastest(lambda: _op_min_max_jit(arrow_masked))),
+        ("pyarrow pc.min_max", _fastest(
+            lambda: pc.min_max(arrow_masked))),
+        ("a + b", _fastest(lambda: _op_add_jit(arrow_masked, other))),
+        ("pyarrow pc.add", _fastest(
+            lambda: pc.add(arrow_masked, other))),
+        ("fused dot", _fastest(
+            lambda: _op_dot_jit(arrow_masked, other))),
+        ("pc.mul + pc.sum", _fastest(
+            lambda: pc.sum(pc.multiply(arrow_masked, other)))),
+        ("fused count(x > 500k)", _fastest(
+            lambda: _op_count_gt_jit(arrow_masked, 500_000))),
+        ("pc.greater + pc.sum", _fastest(
+            lambda: pc.sum(pc.greater(arrow_masked, 500_000)))),
+    ], note="1% nulls; a + b returns (values, mask), pyarrow returns one array")
+
+
+if __name__ == "__main__":
+    main()
