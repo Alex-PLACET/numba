@@ -35,10 +35,13 @@ callback, which is out of scope here. Materialising costs 1.1-2x what
 ``pyarrow.compute`` takes for the same operation, so use it to compose jit
 code, not to replace ``pc.add``.
 
-``min``/``max``/``min_max`` do not special-case NaN: a NaN that is the first
-valid element wins, and any later one is ignored by the comparison. numpy
-propagates NaN and ``pyarrow.compute`` skips it, so neither matches here.
-Integers and temporals are unaffected.
+``min``/``max``/``min_max`` skip NaN, as ``pyarrow.compute`` does (numpy
+propagates it instead). The comparison folds away for integer dtypes. A
+jit kernel cannot write ``arr.data``: the view is typed read-only, so a
+stray store is a compile error rather than corruption of the producer's
+buffer. Reading ``arr[i]`` from jit code does follow the caller's
+``boundscheck`` flag on the dense path; the nullable path always checks,
+because it has to.
 """
 
 from __future__ import annotations
@@ -149,8 +152,18 @@ _FORMATS: dict[str, str] = {
 }
 _TIME_UNITS: dict[str, str] = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
 
-_EMPTY_VALID = np.empty(0, dtype=np.uint8)
-_EMPTY_VALID.flags.writeable = False
+_EMPTY: dict[np.dtype, np.ndarray] = {}
+
+
+def _empty(dtype: np.dtype) -> np.ndarray:
+    empty = _EMPTY.get(dtype)
+    if empty is None:
+        empty = _EMPTY[dtype] = np.empty(0, dtype=dtype)
+        empty.flags.writeable = False
+    return empty
+
+
+_EMPTY_VALID = _empty(np.dtype(np.uint8))
 
 
 def _capsule_pointer(capsule: object, name: bytes) -> int:
@@ -226,7 +239,7 @@ def _data_view(array: _ArrowArray, dtype: np.dtype,
                owner: _Owner) -> np.ndarray:
     nbytes = array.length * dtype.itemsize
     if nbytes == 0:
-        return np.empty(0, dtype=dtype)
+        return _empty(dtype)
     ptr = array.buffers[1] if array.n_buffers > 1 else None
     if not ptr:
         raise ValueError("Arrow array has no data buffer")
@@ -281,12 +294,14 @@ class ArrowArrayView:
         return self.length
 
     def __getitem__(self, index: int) -> Any:
+        i = index if index >= 0 else index + self.length
+        if i < 0 or i >= self.length:
+            raise IndexError("Arrow array index out of range")
         if self.null_count != 0:
-            i = index if index >= 0 else index + self.length
             bit = self.offset + i
             if not (self.valid[bit >> 3] >> (bit & 7)) & 1:
                 return None
-        return self.data[index]
+        return self.data[i]
 
     def __repr__(self) -> str:
         return (f"ArrowArrayView({self.dtype}, length={self.length}, "
@@ -334,10 +349,12 @@ def _from_stream(capsule: object) -> tuple[_ArrowSchema, _ArrowArray]:
     has_more = False
     if error is None:
         extra = _ArrowArray()
-        has_more = (get_next(ctypes.byref(stream), ctypes.byref(extra)) == 0
-                    and bool(extra.release))
+        probe = get_next(ctypes.byref(stream), ctypes.byref(extra))
+        has_more = probe == 0 and bool(extra.release)
         if has_more:
             _release_struct(extra, _ArrayRelease)
+        elif probe != 0:
+            error = _stream_error(stream, get_error)
     _release_struct(stream, _StreamRelease)
     if error is not None or has_more:
         _release_struct(array, _ArrayRelease)
@@ -420,7 +437,7 @@ class ArrowArrayType(types.Type):
 
     @property
     def array_type(self) -> types.Array:
-        return types.Array(self.dtype, 1, "C")
+        return types.Array(self.dtype, 1, "C", readonly=True)
 
 
 @register_model(ArrowArrayType)
@@ -668,7 +685,7 @@ def _min_impl(arr):
     best = data[0]
     if arr.null_count == 0:
         for i in range(1, length):
-            if data[i] < best:
+            if data[i] < best or best != best:
                 best = data[i]
         return best
     valid = arr.valid
@@ -680,7 +697,7 @@ def _min_impl(arr):
         for k in range(8):
             i = base + k
             if 0 <= i < length and (byte >> k) & 1:
-                if not found or data[i] < best:
+                if not found or data[i] < best or best != best:
                     best = data[i]
                     found = True
     if not found:
@@ -696,7 +713,7 @@ def _max_impl(arr):
     best = data[0]
     if arr.null_count == 0:
         for i in range(1, length):
-            if data[i] > best:
+            if data[i] > best or best != best:
                 best = data[i]
         return best
     valid = arr.valid
@@ -708,7 +725,7 @@ def _max_impl(arr):
         for k in range(8):
             i = base + k
             if 0 <= i < length and (byte >> k) & 1:
-                if not found or data[i] > best:
+                if not found or data[i] > best or best != best:
                     best = data[i]
                     found = True
     if not found:
@@ -742,9 +759,9 @@ def _min_max_impl(arr):
     if arr.null_count == 0:
         for i in range(1, length):
             value = data[i]
-            if value < lo:
+            if value < lo or lo != lo:
                 lo = value
-            if value > hi:
+            if value > hi or hi != hi:
                 hi = value
         return lo, hi
     valid = arr.valid
@@ -762,9 +779,9 @@ def _min_max_impl(arr):
                     hi = value
                     found = True
                 else:
-                    if value < lo:
+                    if value < lo or lo != lo:
                         lo = value
-                    if value > hi:
+                    if value > hi or hi != hi:
                         hi = value
     if not found:
         return None, None
@@ -961,8 +978,6 @@ def _register_binary(op, impl, allowed):
         if allowed is not None and a.dtype not in allowed:
             return None
         return impl
-
-    return _typing
 
 
 for _op, _impl, _allowed in (

@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from numba import jit, typeof, types
+from numba.core.errors import TypingError
 from numba.experimental.arrow import (
     ArrowArrayView,
     arrow_jit,
@@ -638,3 +639,31 @@ class TestArrowNoBitmap(unittest.TestCase):
         self.assertEqual(stats(from_arrow(arr)),
                          (int(expected.sum()),
                           (int(expected.min()), int(expected.max()))))
+
+    def test_min_max_skips_nan(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max(), arr.min_max()
+
+        expected = (1.0, 3.0, (1.0, 3.0))
+        self.assertEqual(bounds(from_arrow(pa.array([1.0, np.nan, 3.0]))),
+                         expected)
+        self.assertEqual(bounds(from_arrow(pa.array([np.nan, 1.0, 3.0]))),
+                         expected)
+
+    def test_data_is_read_only_in_jit(self):
+        @arrow_jit
+        def write(arr):
+            arr.data[0] = 1
+            return arr.data[0]
+
+        with self.assertRaises(TypingError):
+            write(from_arrow(pa.array([1, 2, 3])))
+
+    def test_getitem_out_of_range(self):
+        for src in (pa.array([1, 2, 3]), pa.array([1, None, 3])):
+            view = from_arrow(src)
+            with self.assertRaises(IndexError):
+                view[3]
+            with self.assertRaises(IndexError):
+                view[-4]
