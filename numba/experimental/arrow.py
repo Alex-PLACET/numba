@@ -687,6 +687,7 @@ def _min_impl(arr):
         return None
     best = data[0]
     if arr.null_count == 0:
+        # `best != best` is the NaN test: skip NaN, as pyarrow does.
         for i in range(1, length):
             if data[i] < best or best != best:
                 best = data[i]
@@ -715,6 +716,7 @@ def _max_impl(arr):
         return None
     best = data[0]
     if arr.null_count == 0:
+        # `best != best` is the NaN test: skip NaN, as pyarrow does.
         for i in range(1, length):
             if data[i] > best or best != best:
                 best = data[i]
@@ -760,6 +762,7 @@ def _min_max_impl(arr):
     lo = data[0]
     hi = data[0]
     if arr.null_count == 0:
+        # `lo != lo` / `hi != hi` are the NaN tests: skip NaN, as pyarrow.
         for i in range(1, length):
             value = data[i]
             if value < lo or lo != lo:
