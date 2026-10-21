@@ -43,11 +43,14 @@ code, not to replace ``pc.add``.
 String arrays (``utf8`` and ``large_utf8``) import as
 :class:`ArrowStringView`: ``arr.offsets`` is the int32/int64 offsets buffer
 shifted past the slice offset and ``arr.chars`` the character bytes, both
-views of the producer's memory. Read them directly -- ``arr.offsets[i + 1] -
-arr.offsets[i]`` for a length, ``arr.chars[k]`` for a byte -- which measures
-0.14 ms per 1M rows against ``pyarrow.compute.binary_length``'s 0.30. ``arr[i]``
-builds a fresh array view per element and costs 25 ms for the same loop, so
-keep it for convenience in Python, not inside a scan.
+views of the producer's memory. ``arr[i]`` returns the byte bounds
+``(start, end)``, so a scan reads ``chars[start]`` or ``chars[start:end]``
+with no allocation, and null rows are skipped with ``is_valid(arr, i)``.
+Per 1M rows: lengths from ``offsets`` 0.14 ms against
+``pyarrow.compute.binary_length``'s 0.65, a bounds-plus-first-byte scan
+0.54 ms, the same with a validity check 1.19 ms. Returning a slice from
+``arr[i]`` instead costs 25 ms (38 ms when nullable), because Numba
+allocates an array view per element -- that is why the bounds are returned.
 
 ``min``/``max``/``min_max`` skip NaN, as ``pyarrow.compute`` does (numpy
 propagates it instead); the test is ``x != x``, which LLVM folds away for
@@ -771,28 +774,25 @@ def _ol_len_string(arr):
 
 @overload(operator.getitem)
 def _ol_getitem_string(arr, index):
+    """Return the byte bounds of element *index* as ``(start, end)``.
+
+    A slice of ``arr.chars`` per element would allocate an array view per row:
+    25 ms per 1M rows when dense and 38 ms when nullable, against 0.14 ms for
+    the bounds. Null rows keep their offsets, so they read as whatever bytes
+    sit at that position; use ``is_valid(arr, i)`` to skip them.
+    """
     if not isinstance(arr, ArrowStringType):
         return None
     if not isinstance(index, types.Integer):
         return None
-    if arr.nullable:
-        def impl(arr, index):
-            length = arr.length
-            i = index if index >= 0 else index + length
-            if i < 0 or i >= length:
-                raise IndexError("Arrow array index out of range")
-            bit = arr.offset + i
-            if not (arr.valid[bit >> 3] >> (bit & 7)) & 1:
-                return None
-            return arr.chars[arr.offsets[i]:arr.offsets[i + 1]]
-        return impl
 
     def impl(arr, index):
+        offsets = arr.offsets
         length = arr.length
         i = index if index >= 0 else index + length
         if i < 0 or i >= length:
             raise IndexError("Arrow array index out of range")
-        return arr.chars[arr.offsets[i]:arr.offsets[i + 1]]
+        return offsets[i], offsets[i + 1]
     return impl
 
 

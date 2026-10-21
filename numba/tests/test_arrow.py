@@ -802,9 +802,10 @@ class TestArrowStringJit(unittest.TestCase):
     def test_lengths_in_jit(self):
         @arrow_jit
         def lengths(arr):
+            offsets = arr.offsets
             out = np.empty(len(arr), np.int64)
             for i in range(len(arr)):
-                out[i] = len(arr[i])
+                out[i] = offsets[i + 1] - offsets[i]
             return out
 
         self.assertEqual(list(lengths(pa.array(["a", "bcd", "", "xy"]))),
@@ -813,12 +814,13 @@ class TestArrowStringJit(unittest.TestCase):
     def test_bytes_in_jit(self):
         @arrow_jit
         def first(arr, i):
-            return arr[i][0]
+            start, end = arr[i]
+            return arr.chars[start]
 
         @arrow_jit
         def last(arr, i):
-            text = arr[i]
-            return text[len(text) - 1]
+            start, end = arr[i]
+            return arr.chars[end - 1]
 
         view = from_arrow(pa.array(["hey", "you"]))
         self.assertEqual(first(view, 0), ord("h"))
@@ -829,9 +831,9 @@ class TestArrowStringJit(unittest.TestCase):
         def total_len(arr):
             total = 0
             for i in range(len(arr)):
-                text = arr[i]
-                if text is not None:
-                    total += len(text)
+                if is_valid(arr, i):
+                    start, end = arr[i]
+                    total += end - start
             return total
 
         self.assertEqual(total_len(from_arrow(pa.array(["a", None, "bcd"]))), 4)
