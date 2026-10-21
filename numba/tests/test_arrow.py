@@ -224,6 +224,44 @@ class TestNumbaArrow(unittest.TestCase):
         with self.assertRaises(IndexError):
             f(from_arrow(pa.array([1, 2])))
 
+    def test_nullable_getitem(self):
+        view = from_arrow(pa.array([1, None, 3]))
+
+        @jit
+        def f(arr, i):
+            return arr[i]
+
+        self.assertEqual(f(view, 0), 1)
+        self.assertIsNone(f(view, 1))
+        self.assertIsNone(view[1])
+        self.assertEqual(view[2], 3)
+
+    def test_nullable_getitem_guarded_by_is_valid(self):
+        producer = _Producer([1, 2, 3], null_count=1, valid_bytes=b"\x05")
+        view = from_arrow(producer)
+
+        @jit
+        def f(arr):
+            total = 0
+            for i in range(len(arr)):
+                if is_valid(arr, i):
+                    total += arr[i]
+            return total
+
+        self.assertEqual(f(view), 4)
+
+    def test_nullable_getitem_raises_when_unguarded(self):
+        producer = _Producer([1, 2, 3], null_count=1, valid_bytes=b"\x05")
+        view = from_arrow(producer)
+
+        @jit
+        def f(arr):
+            return arr[1] + 1
+
+        with self.assertRaises(TypeError) as cm:
+            f(view)
+        self.assertIn("got None", str(cm.exception))
+
 
 from numba.experimental.arrow import _ArrowArray, _ArrowSchema  # noqa: E402
 
@@ -235,7 +273,11 @@ _PyCapsule_New.restype = ctypes.py_object
 
 
 class _Producer:
-    """Minimal ArrowArray producer used to observe the release callback."""
+    """Minimal ArrowArray producer used to observe the release callback.
+
+    It owns the value buffer and the release callback, so it must outlive
+    any view created from it.
+    """
 
     def __init__(self, values, null_count=0, valid_bytes=None):
         self.released = 0

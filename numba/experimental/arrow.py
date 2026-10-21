@@ -239,6 +239,11 @@ class ArrowArrayView:
         return self.length
 
     def __getitem__(self, index: int) -> Any:
+        if self.null_count != 0:
+            i = index if index >= 0 else index + self.length
+            bit = self.offset + i
+            if not (self.valid[bit >> 3] >> (bit & 7)) & 1:
+                return None
         return self.data[index]
 
     def __repr__(self) -> str:
@@ -359,14 +364,17 @@ class ArrowArrayType(types.Type):
     """Numba type of a 1-D fixed-width Arrow array."""
 
     dtype: types.Type
+    nullable: bool
 
-    def __init__(self, dtype: types.Type) -> None:
+    def __init__(self, dtype: types.Type, nullable: bool = False) -> None:
         self.dtype = dtype
-        super().__init__(name=f"ArrowArray({dtype})")
+        self.nullable = nullable
+        name = f"ArrowArray({dtype}{', nullable' if nullable else ''})"
+        super().__init__(name=name)
 
     @property
-    def key(self) -> types.Type:
-        return self.dtype
+    def key(self) -> tuple[types.Type, bool]:
+        return self.dtype, self.nullable
 
     @property
     def array_type(self) -> types.Array:
@@ -389,14 +397,15 @@ class _ArrowArrayModel(models.StructModel):
 for _name in ("data", "valid", "length", "null_count", "offset"):
     make_attribute_wrapper(ArrowArrayType, _name, _name)
 
-_TYPE_CACHE: dict[np.dtype, ArrowArrayType] = {}
+_TYPE_CACHE: dict[tuple[np.dtype, bool], ArrowArrayType] = {}
 
 
-def _arrow_type(dtype: np.dtype) -> ArrowArrayType:
-    typ = _TYPE_CACHE.get(dtype)
+def _arrow_type(dtype: np.dtype, nullable: bool) -> ArrowArrayType:
+    key = dtype, nullable
+    typ = _TYPE_CACHE.get(key)
     if typ is None:
-        typ = ArrowArrayType(numpy_support.from_dtype(dtype))
-        _TYPE_CACHE[dtype] = typ
+        typ = ArrowArrayType(numpy_support.from_dtype(dtype), nullable)
+        _TYPE_CACHE[key] = typ
     return typ
 
 
@@ -406,7 +415,7 @@ def _typeof_arrow_array(val: ArrowArrayView,
     for name in ("data", "valid", "length", "null_count", "offset"):
         if not hasattr(val, name):
             raise TypeError(f"ArrowArrayView is missing attribute {name!r}")
-    return _arrow_type(val.dtype)
+    return _arrow_type(val.dtype, val.null_count != 0)
 
 
 @unbox(ArrowArrayType)
@@ -435,8 +444,53 @@ def _ol_len(arr):
 
 @overload(operator.getitem)
 def _ol_getitem(arr, index):
-    if isinstance(arr, ArrowArrayType) and isinstance(index, types.Integer):
-        return lambda arr, index: arr.data[index]
+    if not isinstance(arr, ArrowArrayType):
+        return None
+    if not isinstance(index, types.Integer):
+        return None
+    if arr.nullable:
+        return lambda arr, index: _get_or_none(arr, index)
+    return lambda arr, index: arr.data[index]
+
+
+def _index_to_intp(context, builder, index_val, index_type):
+    intp = context.get_value_type(types.intp)
+    if index_val.type.width == intp.width:
+        return index_val
+    if index_type.signed:
+        return builder.sext(index_val, intp)
+    return builder.zext(index_val, intp)
+
+
+def _check_bounds(context, builder, proxy, idx):
+    zero = ir.Constant(idx.type, 0)
+    idx = builder.select(
+        builder.icmp_signed("<", idx, zero),
+        builder.add(idx, proxy.length),
+        idx,
+    )
+    with builder.if_then(builder.or_(
+            builder.icmp_signed("<", idx, zero),
+            builder.icmp_signed(">=", idx, proxy.length),)):
+        context.call_conv.return_user_exc(
+            builder, IndexError, ("Arrow array index out of range",))
+    return idx
+
+
+def _validity_bit(context, builder, proxy, idx):
+    bitmap = context.make_array(types.Array(types.uint8, 1, "C"))(
+        context, builder, value=proxy.valid)
+    bit = builder.add(proxy.offset, idx)
+    byte = builder.load(builder.gep(
+        bitmap.data, [builder.lshr(bit, ir.Constant(idx.type, 3))]))
+    shifted = builder.lshr(
+        byte,
+        builder.trunc(builder.and_(bit, ir.Constant(idx.type, 7)),
+                      ir.IntType(8)),
+    )
+    return builder.icmp_unsigned(
+        "!=", builder.and_(shifted, ir.Constant(ir.IntType(8), 1)),
+        ir.Constant(ir.IntType(8), 0))
 
 
 @intrinsic
@@ -452,46 +506,48 @@ def is_valid(typingctx, arr, index):
         arr_val, index_val = args
         proxy = cgutils.create_struct_proxy(signature.args[0])(
             context, builder, value=arr_val)
-        intp = context.get_value_type(types.intp)
-        if index_val.type.width == intp.width:
-            idx = index_val
-        elif index.signed:
-            idx = builder.sext(index_val, intp)
-        else:
-            idx = builder.zext(index_val, intp)
-        zero = ir.Constant(intp, 0)
-        idx = builder.select(
-            builder.icmp_signed("<", idx, zero),
-            builder.add(idx, proxy.length),
-            idx,
-        )
-        with builder.if_then(builder.or_(
-                builder.icmp_signed("<", idx, zero),
-                builder.icmp_signed(">=", idx, proxy.length),)):
-            context.call_conv.return_user_exc(
-                builder, IndexError, ("Arrow array index out of range",))
-
-        bitmap = context.make_array(types.Array(types.uint8, 1, "C"))(
-            context, builder, value=proxy.valid)
-        bit = builder.add(proxy.offset, idx)
-        byte = builder.load(builder.gep(
-            bitmap.data, [builder.lshr(bit, ir.Constant(intp, 3))]))
-        shifted = builder.lshr(
-            byte,
-            builder.trunc(builder.and_(bit, ir.Constant(intp, 7)),
-                          ir.IntType(8)),
-        )
-        set_bit = builder.icmp_unsigned(
-            "!=", builder.and_(shifted, ir.Constant(ir.IntType(8), 1)),
-            ir.Constant(ir.IntType(8), 0))
+        idx = _check_bounds(
+            context, builder, proxy,
+            _index_to_intp(context, builder, index_val, index))
+        set_bit = _validity_bit(context, builder, proxy, idx)
         out = cgutils.alloca_once(builder, ir.IntType(1))
         with builder.if_else(
-                builder.icmp_signed("!=", proxy.null_count, zero)
+                builder.icmp_signed("!=", proxy.null_count,
+                                    ir.Constant(idx.type, 0))
         ) as (with_nulls, no_nulls):
             with with_nulls:
                 builder.store(set_bit, out)
             with no_nulls:
                 builder.store(cgutils.true_bit, out)
         return builder.load(out)
+
+    return sig, codegen
+
+
+@intrinsic
+def _get_or_none(typingctx, arr, index):
+    if not isinstance(arr, ArrowArrayType) or not arr.nullable:
+        return None
+    if not isinstance(index, types.Integer):
+        return None
+    sig = types.Optional(arr.dtype)(arr, index)
+
+    def codegen(context, builder, signature, args):
+        arr_val, index_val = args
+        arr_type = signature.args[0]
+        proxy = cgutils.create_struct_proxy(arr_type)(
+            context, builder, value=arr_val)
+        idx = _check_bounds(
+            context, builder, proxy,
+            _index_to_intp(context, builder, index_val, index))
+        data = context.make_array(arr_type.array_type)(
+            context, builder, value=proxy.data)
+        ptr = builder.bitcast(
+            data.data, context.get_value_type(arr_type.dtype).as_pointer())
+        out = cgutils.create_struct_proxy(signature.return_type)(
+            context, builder)
+        out.data = builder.load(builder.gep(ptr, [idx]))
+        out.valid = _validity_bit(context, builder, proxy, idx)
+        return out._getvalue()
 
     return sig, codegen

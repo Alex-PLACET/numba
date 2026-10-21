@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 import polars as pl
 
 from numba import jit, njit
-from numba.experimental.arrow import arrow_jit, is_valid
+from numba.experimental.arrow import arrow_jit
 
 N = 1_000_000
 REPEATS = 7
@@ -55,8 +55,9 @@ def _sum_arrow_plain(arr):
 def _sum_arrow_masked(arr):
     total = 0
     for i in range(len(arr)):
-        if is_valid(arr, i):
-            total += arr[i]
+        value = arr[i]
+        if value is not None:
+            total += value
     return total
 
 
