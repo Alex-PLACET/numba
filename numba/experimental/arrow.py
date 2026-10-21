@@ -42,6 +42,7 @@ from numba.extending import (
     intrinsic,
     make_attribute_wrapper,
     overload,
+    overload_method,
     register_model,
     unbox,
 )
@@ -566,3 +567,192 @@ def _get_or_none(typingctx, arr, index):
         return out._getvalue()
 
     return sig, codegen
+
+
+def _sum_signed_impl(arr):
+    data = arr.data
+    total = 0
+    for i in range(len(data)):
+        total += data[i]
+    if arr.null_count == 0:
+        return total
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        if byte != 0xFF:
+            base = b * 8 - offset
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and not (byte >> k) & 1:
+                    total -= data[i]
+    return total
+
+
+def _sum_unsigned_impl(arr):
+    data = arr.data
+    total = np.uint64(0)
+    for i in range(len(data)):
+        total += data[i]
+    if arr.null_count == 0:
+        return total
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        if byte != 0xFF:
+            base = b * 8 - offset
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and not (byte >> k) & 1:
+                    total -= data[i]
+    return total
+
+
+def _sum_float_impl(arr):
+    data = arr.data
+    total = 0.0
+    if arr.null_count == 0:
+        for i in range(len(data)):
+            total += data[i]
+        return total
+    valid = arr.valid
+    offset = arr.offset
+    length = arr.length
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        if byte == 0xFF:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length:
+                    total += data[i]
+        else:
+            for k in range(8):
+                i = base + k
+                if 0 <= i < length and (byte >> k) & 1:
+                    total += data[i]
+    return total
+
+
+def _min_impl(arr):
+    data = arr.data
+    length = arr.length
+    if length == 0:
+        return None
+    best = data[0]
+    if arr.null_count == 0:
+        for i in range(1, length):
+            if data[i] < best:
+                best = data[i]
+        return best
+    valid = arr.valid
+    offset = arr.offset
+    found = False
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        for k in range(8):
+            i = base + k
+            if 0 <= i < length and (byte >> k) & 1:
+                if not found or data[i] < best:
+                    best = data[i]
+                    found = True
+    if not found:
+        return None
+    return best
+
+
+def _max_impl(arr):
+    data = arr.data
+    length = arr.length
+    if length == 0:
+        return None
+    best = data[0]
+    if arr.null_count == 0:
+        for i in range(1, length):
+            if data[i] > best:
+                best = data[i]
+        return best
+    valid = arr.valid
+    offset = arr.offset
+    found = False
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        for k in range(8):
+            i = base + k
+            if 0 <= i < length and (byte >> k) & 1:
+                if not found or data[i] > best:
+                    best = data[i]
+                    found = True
+    if not found:
+        return None
+    return best
+
+
+@overload_method(ArrowArrayType, "sum")
+def _ol_sum_method(arr):
+    if isinstance(arr.dtype, types.Float):
+        return _sum_float_impl
+    if isinstance(arr.dtype, types.Integer):
+        if arr.dtype in types.unsigned_domain:
+            return _sum_unsigned_impl
+        return _sum_signed_impl
+    return None
+
+
+@overload_method(ArrowArrayType, "min")
+def _ol_min_method(arr):
+    return _min_impl
+
+
+def _min_max_impl(arr):
+    data = arr.data
+    length = arr.length
+    if length == 0:
+        return None, None
+    lo = data[0]
+    hi = data[0]
+    if arr.null_count == 0:
+        for i in range(1, length):
+            value = data[i]
+            if value < lo:
+                lo = value
+            if value > hi:
+                hi = value
+        return lo, hi
+    valid = arr.valid
+    offset = arr.offset
+    found = False
+    for b in range((offset + length + 7) // 8):
+        byte = valid[b]
+        base = b * 8 - offset
+        for k in range(8):
+            i = base + k
+            if 0 <= i < length and (byte >> k) & 1:
+                value = data[i]
+                if not found:
+                    lo = value
+                    hi = value
+                    found = True
+                else:
+                    if value < lo:
+                        lo = value
+                    if value > hi:
+                        hi = value
+    if not found:
+        return None, None
+    return lo, hi
+
+
+@overload_method(ArrowArrayType, "min_max")
+def _ol_min_max_method(arr):
+    return _min_max_impl
+
+
+@overload_method(ArrowArrayType, "max")
+def _ol_max_method(arr):
+    return _max_impl

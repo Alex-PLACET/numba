@@ -396,3 +396,132 @@ class TestArrowJit(unittest.TestCase):
         total(pa.array([1]))
         self.assertEqual(len(total.signatures), 1)
         self.assertEqual(total.py_func(from_arrow(pa.array([1, 2]))), 3)
+
+
+@requires_pyarrow
+class TestArrowReductions(unittest.TestCase):
+    def test_sum_dense(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([1, 2, 3, 4]))), 10)
+
+    def test_sum_skips_nulls(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([1, 2, None, 4]))), 7)
+
+    def test_sum_all_null(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(total(from_arrow(src)), 0)
+
+    def test_sum_empty(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertEqual(total(from_arrow(pa.array([], type=pa.int64()))), 0)
+
+    def test_sum_widens_int8(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([100, 100, 100], type=pa.int8())
+        self.assertEqual(total(from_arrow(src)), 300)
+
+    def test_sum_uint64(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        src = pa.array([1, 2, None, 3], type=pa.uint64())
+        self.assertEqual(total(from_arrow(src)), 6)
+
+    def test_sum_float(self):
+        @arrow_jit
+        def total(arr):
+            return arr.sum()
+
+        self.assertAlmostEqual(total(from_arrow(pa.array([0.5, None, 2.5]))),
+                               3.0)
+
+    def test_min_max_nulls(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, None, 9, 1]))),
+                         (1, 9))
+
+    def test_min_max_dense(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, 9, 1]))), (1, 9))
+
+    def test_min_max_all_null(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+    def test_min_max_empty(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min(), arr.max()
+
+        src = pa.array([], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+    def test_reductions_sliced(self):
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min(), arr.max()
+
+        src = pa.array([1, None, 3, 4, 5, None, 7]).slice(2)
+        self.assertEqual(stats(from_arrow(src)), (19, 3, 7))
+
+    def test_matches_pyarrow_compute(self):
+        import pyarrow.compute as pc
+
+        rng = np.random.default_rng(7)
+        values = rng.integers(-1000, 1000, 1000).astype(np.int64)
+        mask = rng.random(1000) < 0.1
+        src = pa.array(values, mask=mask)
+
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min(), arr.max()
+
+        self.assertEqual(stats(from_arrow(src)),
+                         (int(pc.sum(src).as_py()),
+                          pc.min(src).as_py(),
+                          pc.max(src).as_py()))
+
+    def test_min_max_pair(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min_max()
+
+        self.assertEqual(bounds(from_arrow(pa.array([3, None, 9, 1]))),
+                         (1, 9))
+        self.assertEqual(bounds(from_arrow(pa.array([3, 9, 1]))), (1, 9))
+
+    def test_min_max_pair_all_null(self):
+        @arrow_jit
+        def bounds(arr):
+            return arr.min_max()
+
+        src = pa.array([None, None], type=pa.int64())
+        self.assertEqual(bounds(from_arrow(src)), (None, None))
