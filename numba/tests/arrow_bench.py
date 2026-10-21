@@ -253,6 +253,7 @@ def main():
     assert _byte_aware_sum(big_view) == expected_big
     assert _two_pass_sum(big_view) == expected_big
     assert _parallel_sum(big_view) == expected_big
+    assert _op_sum_jit(big_view) == expected_big
     _report("sum, 1% nulls, out of cache", [
         ("arr[i] is not None loop",
          _fastest(lambda: _arrow_sum_masked(big_view))),
@@ -262,6 +263,7 @@ def main():
          _fastest(lambda: _two_pass_sum(big_view))),
         ("parallel two-pass",
          _fastest(lambda: _parallel_sum(big_view))),
+        ("arr.sum()", _fastest(lambda: _op_sum_jit(big_view))),
         ("pyarrow pc.sum", _fastest(lambda: pc.sum(big_arrow))),
     ], note="4M elements (32 MB) against a 24 MB L3", n=big)
 

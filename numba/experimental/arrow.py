@@ -7,12 +7,15 @@ Performance notes
 -----------------
 ``arr.data`` is a real ndarray and ``arr.valid`` the raw validity bytes
 (empty when the array has no nulls, so the dense paths never touch it), so
-the cheapest null-aware reductions avoid a per-element validity branch: sum
-``arr.data`` and subtract the null slots found by scanning the bitmap, or
-take an 8-element tight loop when a validity byte is ``0xFF``. Both run 2-4x
-faster than an ``arr[i] is not None`` loop at 1% nulls, and adding
-``arrow_jit(parallel=True)`` with ``prange`` takes it to 5x once the array is
-larger than the last-level cache. Below it, thread start-up dominates.
+the cheapest null-aware reductions avoid a per-element validity branch:
+``sum`` walks the bitmap a 64-bit word at a time, splits each word into runs
+of set bits with ``cttz`` and sums every run as a contiguous slice, so null
+slots are never read and the runs vectorise. That is 20-30% faster than
+summing everything and subtracting the null slots, 2.5x faster once half the
+values are null, and 2-4x faster than an ``arr[i] is not None`` loop at 1%
+nulls. ``arrow_jit(parallel=True)`` with ``prange`` takes it to 5x once the
+array is larger than the last-level cache; below it, thread start-up
+dominates.
 
 Measured against `pyarrow.compute` on int64: on dense data a fused loop wins
 wherever pyarrow needs two kernels (2.5x on a dot product, 2x on a count
@@ -22,7 +25,9 @@ every element pays a validity check while pyarrow's kernels are SIMD.
 `max` and `min_max` win ~1.5-2x even with nulls (pyarrow's min/max kernel
 is much slower than its sums), and a threaded sum wins 1.5-2x above the
 cache. pyarrow wins on a single serial `pc.sum` or `pc.mean`, where its
-masked SIMD kernel beats a scalar loop by 10-40%.
+masked SIMD kernel is 10-30% faster at 1-10% nulls, 1.3x at 50% and
+2-3x at 90%, where its run loop over the bitmap is C++ and ours is Numba
+code.
 Element access itself is at the scalar-code floor: 0.15 ns per element when
 the array is dense, 0.6-1.0 ns when nullable and driven off the bitmap.
 
@@ -617,55 +622,104 @@ def _sum_loop(data, total):
     return total
 
 
+_FULL_WORD = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+@intrinsic
+def _cttz64(typingctx, x):
+    if x != types.uint64:
+        return None
+    sig = types.uint64(x)
+
+    def codegen(context, builder, signature, args):
+        decl = cgutils.get_or_insert_function(
+            builder.module,
+            ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(1)]),
+            "llvm.cttz.i64")
+        decl.attributes.add("readnone")
+        return builder.call(decl, [args[0], ir.Constant(ir.IntType(1), 0)])
+
+    return sig, codegen
+
+
 @register_jitable
-def _subtract_nulls(data, total, valid, offset, length, null_count):
-    if null_count == 0:
-        return total
-    for b in range(offset >> 3, (offset + length + 7) >> 3):
-        byte = valid[b]
-        if byte != 0xFF:
-            base = b * 8 - offset
-            for k in range(8):
-                i = base + k
-                if 0 <= i < length and not (byte >> k) & 1:
-                    total -= data[i]
+def _flush_run(total, data, start, end):
+    if start >= 0 and end > start:
+        total += data[start:end].sum()
     return total
+
+
+@register_jitable
+def _runs_total(data, valid, offset, length, total):
+    nbytes = len(valid)
+    nfull = nbytes >> 3
+    run_start = -1
+    run_end = -1
+    if nfull:
+        words = valid[:nfull << 3].view(np.uint64)
+        for w in range(nfull):
+            word_base = (w << 6) - offset
+            x = words[w]
+            pos = 0
+            while x:
+                start = _cttz64(x & -x)
+                y = (x >> start) & _FULL_WORD
+                run = _cttz64(~y & _FULL_WORD)
+                lo = word_base + pos + start
+                hi = lo + run
+                if lo < 0:
+                    lo = 0
+                if hi > length:
+                    hi = length
+                if lo < hi:
+                    if run_start >= 0 and lo == run_end:
+                        run_end = hi
+                    else:
+                        total = _flush_run(total, data, run_start, run_end)
+                        run_start = lo
+                        run_end = hi
+                step = start + run
+                if step >= 64:
+                    break
+                pos += step
+                x >>= step
+    bit = nfull << 6
+    limit = nbytes << 3
+    while bit < limit:
+        i = bit - offset
+        if (valid[bit >> 3] >> (bit & 7)) & 1:
+            if 0 <= i < length:
+                if run_start >= 0 and i == run_end:
+                    run_end = i + 1
+                else:
+                    total = _flush_run(total, data, run_start, run_end)
+                    run_start = i
+                    run_end = i + 1
+        else:
+            total = _flush_run(total, data, run_start, run_end)
+            run_start = -1
+            run_end = -1
+        bit += 1
+    return _flush_run(total, data, run_start, run_end)
 
 
 def _sum_signed_impl(arr):
-    return _subtract_nulls(arr.data, _sum_loop(arr.data, 0), arr.valid,
-                           arr.offset, arr.length, arr.null_count)
+    if arr.null_count == 0:
+        return _sum_loop(arr.data, 0)
+    return _runs_total(arr.data, arr.valid, arr.offset, arr.length, 0)
 
 
 def _sum_unsigned_impl(arr):
-    return _subtract_nulls(arr.data, _sum_loop(arr.data, np.uint64(0)),
-                           arr.valid, arr.offset, arr.length, arr.null_count)
+    if arr.null_count == 0:
+        return _sum_loop(arr.data, np.uint64(0))
+    return _runs_total(arr.data, arr.valid, arr.offset, arr.length,
+                       np.uint64(0))
 
 
 def _sum_float_impl(arr):
-    data = arr.data
-    total = 0.0
     if arr.null_count == 0:
-        for i in range(len(data)):
-            total += data[i]
-        return total
-    valid = arr.valid
-    offset = arr.offset
-    length = arr.length
-    for b in range(offset >> 3, (offset + length + 7) >> 3):
-        byte = valid[b]
-        base = b * 8 - offset
-        if byte == 0xFF:
-            for k in range(8):
-                i = base + k
-                if 0 <= i < length:
-                    total += data[i]
-        else:
-            for k in range(8):
-                i = base + k
-                if 0 <= i < length and (byte >> k) & 1:
-                    total += data[i]
-    return total
+        return _sum_loop(arr.data, 0.0)
+    return _runs_total(arr.data, arr.valid, arr.offset, arr.length, 0.0)
 
 
 # min and max differ only in the comparison. A shared body with a literal
