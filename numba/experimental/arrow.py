@@ -11,6 +11,7 @@ import operator
 from typing import Any, Callable, TypeVar
 
 import numpy as np
+from llvmlite import ir
 
 from numba.core import cgutils, types
 from numba.core.datamodel import models
@@ -19,15 +20,21 @@ from numba.core.pythonapi import _UnboxContext
 from numba.core.typing.typeof import _TypeofContext, typeof_impl
 from numba.extending import (
     NativeValue,
+    intrinsic,
     make_attribute_wrapper,
     overload,
-    overload_method,
     register_model,
     unbox,
 )
 from numba.np import numpy_support
 
-__all__ = ["ArrowArrayType", "ArrowArrayView", "arrow_jit", "from_arrow"]
+__all__ = [
+    "ArrowArrayType",
+    "ArrowArrayView",
+    "arrow_jit",
+    "from_arrow",
+    "is_valid",
+]
 
 _StructT = TypeVar("_StructT", bound=ctypes.Structure)
 
@@ -432,16 +439,59 @@ def _ol_getitem(arr, index):
         return lambda arr, index: arr.data[index]
 
 
-@overload_method(ArrowArrayType, "is_valid")
-def _ol_is_valid(arr, index):
-    def impl(arr, index):
-        if index < 0:
-            index += arr.length
-        if index < 0 or index >= arr.length:
-            raise IndexError("Arrow array index out of range")
-        if arr.null_count == 0:
-            return True
-        bit = arr.offset + index
-        return ((arr.valid[bit >> 3] >> (bit & 7)) & 1) == 1
+@intrinsic
+def is_valid(typingctx, arr, index):
+    """Return True if element *index* of an Arrow array is not null."""
+    if not isinstance(arr, ArrowArrayType):
+        return None
+    if not isinstance(index, types.Integer):
+        return None
+    sig = types.boolean(arr, index)
 
-    return impl
+    def codegen(context, builder, signature, args):
+        arr_val, index_val = args
+        proxy = cgutils.create_struct_proxy(signature.args[0])(
+            context, builder, value=arr_val)
+        intp = context.get_value_type(types.intp)
+        if index_val.type.width == intp.width:
+            idx = index_val
+        elif index.signed:
+            idx = builder.sext(index_val, intp)
+        else:
+            idx = builder.zext(index_val, intp)
+        zero = ir.Constant(intp, 0)
+        idx = builder.select(
+            builder.icmp_signed("<", idx, zero),
+            builder.add(idx, proxy.length),
+            idx,
+        )
+        with builder.if_then(builder.or_(
+                builder.icmp_signed("<", idx, zero),
+                builder.icmp_signed(">=", idx, proxy.length),)):
+            context.call_conv.return_user_exc(
+                builder, IndexError, ("Arrow array index out of range",))
+
+        bitmap = context.make_array(types.Array(types.uint8, 1, "C"))(
+            context, builder, value=proxy.valid)
+        bit = builder.add(proxy.offset, idx)
+        byte = builder.load(builder.gep(
+            bitmap.data, [builder.lshr(bit, ir.Constant(intp, 3))]))
+        shifted = builder.lshr(
+            byte,
+            builder.trunc(builder.and_(bit, ir.Constant(intp, 7)),
+                          ir.IntType(8)),
+        )
+        set_bit = builder.icmp_unsigned(
+            "!=", builder.and_(shifted, ir.Constant(ir.IntType(8), 1)),
+            ir.Constant(ir.IntType(8), 0))
+        out = cgutils.alloca_once(builder, ir.IntType(1))
+        with builder.if_else(
+                builder.icmp_signed("!=", proxy.null_count, zero)
+        ) as (with_nulls, no_nulls):
+            with with_nulls:
+                builder.store(set_bit, out)
+            with no_nulls:
+                builder.store(cgutils.true_bit, out)
+        return builder.load(out)
+
+    return sig, codegen

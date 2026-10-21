@@ -5,7 +5,12 @@ import unittest
 import numpy as np
 
 from numba import jit, typeof, types
-from numba.experimental.arrow import ArrowArrayView, arrow_jit, from_arrow
+from numba.experimental.arrow import (
+    ArrowArrayView,
+    arrow_jit,
+    from_arrow,
+    is_valid,
+)
 
 try:
     import pyarrow as pa
@@ -188,7 +193,7 @@ class TestNumbaArrow(unittest.TestCase):
 
         @jit
         def mask(arr):
-            return [arr.is_valid(i) for i in range(len(arr))]
+            return [is_valid(arr, i) for i in range(len(arr))]
 
         self.assertEqual(mask(view), [True, False, True])
 
@@ -197,7 +202,7 @@ class TestNumbaArrow(unittest.TestCase):
         def f(arr):
             total = 0.0
             for i in range(len(arr)):
-                if arr.is_valid(i):
+                if is_valid(arr, i):
                     total += arr[i]
             return total
 
@@ -206,7 +211,7 @@ class TestNumbaArrow(unittest.TestCase):
     def test_is_valid_negative_index(self):
         @jit
         def f(arr):
-            return arr.is_valid(-1)
+            return is_valid(arr, -1)
 
         self.assertTrue(f(from_arrow(pa.array([1, 2]))))
         self.assertFalse(f(from_arrow(pa.array([1, None]))))
@@ -214,7 +219,7 @@ class TestNumbaArrow(unittest.TestCase):
     def test_is_valid_out_of_range(self):
         @jit
         def f(arr):
-            return arr.is_valid(5)
+            return is_valid(arr, 5)
 
         with self.assertRaises(IndexError):
             f(from_arrow(pa.array([1, 2])))
@@ -302,7 +307,7 @@ class TestOwnership(unittest.TestCase):
 
         @jit
         def mask(arr):
-            return [arr.is_valid(i) for i in range(len(arr))]
+            return [is_valid(arr, i) for i in range(len(arr))]
 
         self.assertEqual(mask(view), [True, False])
 
