@@ -5,7 +5,8 @@ Arrays are imported through the Arrow PyCapsule interface, so any producer
 
 Performance notes
 -----------------
-``arr.data`` is a real ndarray and ``arr.valid`` the raw validity bytes, so
+``arr.data`` is a real ndarray and ``arr.valid`` the raw validity bytes
+(empty when the array has no nulls, so the dense paths never touch it), so
 the cheapest null-aware reductions avoid a per-element validity branch: sum
 ``arr.data`` and subtract the null slots found by scanning the bitmap, or
 take an 8-element tight loop when a validity byte is ``0xFF``. Both run 2-4x
@@ -143,6 +144,9 @@ _FORMATS: dict[str, str] = {
 }
 _TIME_UNITS: dict[str, str] = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
 
+_EMPTY_VALID = np.empty(0, dtype=np.uint8)
+_EMPTY_VALID.flags.writeable = False
+
 
 def _capsule_pointer(capsule: object, name: bytes) -> int:
     try:
@@ -226,8 +230,10 @@ def _data_view(array: _ArrowArray, dtype: np.dtype,
 
 
 def _validity_view(array: _ArrowArray, owner: _Owner) -> np.ndarray:
+    if array.null_count == 0:
+        return _EMPTY_VALID
     if array.n_buffers == 0 or not array.buffers[0]:
-        return np.empty(0, dtype=np.uint8)
+        return _EMPTY_VALID
     nbytes = (array.offset + array.length + 7) // 8
     return np.frombuffer(_buffer(array.buffers[0], nbytes, owner),
                          dtype=np.uint8)

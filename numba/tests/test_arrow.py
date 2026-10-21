@@ -590,3 +590,37 @@ class TestArrowElementwise(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             add(from_arrow(pa.array([1, 2])), from_arrow(pa.array([1])))
+
+
+@requires_pyarrow
+class TestArrowNoBitmap(unittest.TestCase):
+    def test_no_bitmap_is_non_nullable(self):
+        src = pa.array([1, 2, 3])
+        self.assertIsNone(src.buffers()[0])
+        view = from_arrow(src)
+        self.assertEqual(view.valid.size, 0)
+        self.assertEqual(view.null_count, 0)
+        self.assertFalse(typeof(view).nullable)
+        self.assertEqual(view[2], 3)
+
+    def test_bitmap_without_nulls_is_dropped(self):
+        src = pa.array([None] + list(range(1, 100))).slice(1)
+        self.assertIsNotNone(src.buffers()[0])
+        self.assertEqual(src.null_count, 0)
+        view = from_arrow(src)
+        self.assertEqual(view.valid.size, 0)
+        self.assertFalse(typeof(view).nullable)
+
+        @arrow_jit
+        def all_valid(arr):
+            return is_valid(arr, 0) and is_valid(arr, 98)
+
+        self.assertTrue(all_valid(view))
+        self.assertEqual(view[5], 6)
+
+    def test_reductions_on_bitmap_free_array(self):
+        @arrow_jit
+        def stats(arr):
+            return arr.sum(), arr.min_max()
+
+        self.assertEqual(stats(pa.array([4, 2, 9])), (15, (2, 9)))
