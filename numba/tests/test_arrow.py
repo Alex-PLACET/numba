@@ -525,3 +525,68 @@ class TestArrowReductions(unittest.TestCase):
 
         src = pa.array([None, None], type=pa.int64())
         self.assertEqual(bounds(from_arrow(src)), (None, None))
+
+
+@requires_pyarrow
+class TestArrowElementwise(unittest.TestCase):
+    def test_add_propagates_nulls(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        a = from_arrow(pa.array([1, None, 3]))
+        b = from_arrow(pa.array([10, 20, None]))
+        values, mask = add(a, b)
+        self.assertEqual(list(mask), [True, False, False])
+        self.assertEqual(values[0], 11)
+
+    def test_add_dense(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        values, mask = add(from_arrow(pa.array([1, 2, 3])),
+                           from_arrow(pa.array([10, 20, 30])))
+        np.testing.assert_array_equal(values, [11, 22, 33])
+        self.assertTrue(mask.all())
+
+    def test_sub_and_mul(self):
+        @arrow_jit
+        def ops(a, b):
+            return a - b, a * b
+
+        (diff, diff_mask), (prod, prod_mask) = ops(
+            from_arrow(pa.array([10, 20, None])),
+            from_arrow(pa.array([1, None, 3])))
+        self.assertEqual(diff[0], 9)
+        self.assertEqual(prod[0], 10)
+        self.assertEqual(list(diff_mask), [True, False, False])
+        self.assertEqual(list(prod_mask), [True, False, False])
+
+    def test_truediv_float(self):
+        @arrow_jit
+        def div(a, b):
+            return a / b
+
+        values, mask = div(from_arrow(pa.array([1.0, 2.0, None])),
+                           from_arrow(pa.array([2.0, None, 4.0])))
+        self.assertEqual(list(mask), [True, False, False])
+        self.assertEqual(values[0], 0.5)
+
+    def test_comparison(self):
+        @arrow_jit
+        def cmp(a, b):
+            return a > b
+
+        values, mask = cmp(from_arrow(pa.array([1, 5, None, 3])),
+                           from_arrow(pa.array([2, 2, 2, None])))
+        self.assertEqual(list(mask), [True, True, False, False])
+        self.assertEqual(list(values[mask]), [False, True])
+
+    def test_length_mismatch(self):
+        @arrow_jit
+        def add(a, b):
+            return a + b
+
+        with self.assertRaises(ValueError):
+            add(from_arrow(pa.array([1, 2])), from_arrow(pa.array([1])))
