@@ -13,12 +13,15 @@ faster than an ``arr[i] is not None`` loop at 1% nulls, and adding
 ``arrow_jit(parallel=True)`` with ``prange`` takes it to 5x once the array is
 larger than the last-level cache. Below it, thread start-up dominates.
 
-Measured against `pyarrow.compute` on int64 with 1% nulls: a fused loop wins
-wherever pyarrow needs two kernels (~3x on sum of squares, which would
-materialise an intermediate), ``max`` wins ~2x because pyarrow's min/max
-kernel is far slower than its sums, and a threaded reduction wins 1.5-2x
-above the cache. pyarrow wins only on a single serial ``pc.sum`` or
-``pc.mean``, where its masked SIMD kernel beats a scalar loop by 10-20%.
+Measured against `pyarrow.compute` on int64: on dense data a fused loop wins
+wherever pyarrow needs two kernels (2.5x on a dot product, 2x on a count
+above a threshold, 3x on sum of squares, all of which materialise an
+intermediate); with 1% nulls the same fused loops drop to parity, because
+every element pays a validity check while pyarrow's kernels are SIMD.
+`max` and `min_max` win ~1.5-2x even with nulls (pyarrow's min/max kernel
+is much slower than its sums), and a threaded sum wins 1.5-2x above the
+cache. pyarrow wins on a single serial `pc.sum` or `pc.mean`, where its
+masked SIMD kernel beats a scalar loop by 10-40%.
 Element access itself is at the scalar-code floor: 0.15 ns per element when
 the array is dense, 0.6-1.0 ns when nullable and driven off the bitmap.
 

@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 import polars as pl
 
 from numba import jit, njit
-from numba.experimental.arrow import arrow_jit, from_arrow
+from numba.experimental.arrow import arrow_jit, from_arrow, is_valid
 
 N = 1_000_000
 REPEATS = 7
@@ -101,6 +101,34 @@ def _sum_two_pass(arr):
     return total
 
 
+def _op_sum(arr):
+    return arr.sum()
+
+
+def _op_min_max(arr):
+    return arr.min_max()
+
+
+def _op_add(a, b):
+    return a + b
+
+
+def _op_dot(a, b):
+    total = 0
+    for i in range(len(a)):
+        if is_valid(a, i) and is_valid(b, i):
+            total += a.data[i] * b.data[i]
+    return total
+
+
+def _op_count_gt(arr, threshold):
+    count = 0
+    for i in range(len(arr)):
+        if is_valid(arr, i) and arr.data[i] > threshold:
+            count += 1
+    return count
+
+
 def _build(n):
     out = np.empty(n, dtype=np.int64)
     for i in range(n):
@@ -126,6 +154,11 @@ _njit_fill = njit(_fill)
 _byte_aware_sum = arrow_jit(_sum_byte_aware)
 _two_pass_sum = arrow_jit(_sum_two_pass)
 _parallel_sum = arrow_jit(_sum_two_pass, parallel=True)
+_op_sum_jit = arrow_jit(_op_sum)
+_op_min_max_jit = arrow_jit(_op_min_max)
+_op_add_jit = arrow_jit(_op_add)
+_op_dot_jit = arrow_jit(_op_dot)
+_op_count_gt_jit = arrow_jit(_op_count_gt)
 
 
 def _report(title, rows, note=None, n=N):
@@ -231,6 +264,42 @@ def main():
          _fastest(lambda: _parallel_sum(big_view))),
         ("pyarrow pc.sum", _fastest(lambda: pc.sum(big_arrow))),
     ], note="4M elements (32 MB) against a 24 MB L3", n=big)
+
+    other = pa.array(N - 1 - np.arange(N), type=pa.int64(), mask=~mask)
+    expected_min = int(values[mask].min())
+    expected_max = int(values[mask].max())
+    assert _op_sum_jit(arrow_masked) == expected
+    assert _op_min_max_jit(arrow_masked) == (expected_min, expected_max)
+    added, valid = _op_add_jit(arrow_masked, other)
+    assert int(valid.sum()) == int(mask.sum())
+    assert added[1] == int(arrow_masked[1].as_py() + other[1].as_py())
+    assert _op_dot_jit(arrow_masked, other) == int(
+        pc.sum(pc.multiply(arrow_masked, other)).as_py())
+    assert _op_count_gt_jit(arrow_masked, 500_000) == int(
+        pc.sum(pc.greater(arrow_masked, 500_000)).as_py())
+    _op_sum_jit(arrow_masked)
+    _op_min_max_jit(arrow_masked)
+    _op_dot_jit(arrow_masked, other)
+    _op_count_gt_jit(arrow_masked, 500_000)
+    _op_add_jit(arrow_masked, other)
+    _report("operations on the Arrow type", [
+        ("arr.sum()", _fastest(lambda: _op_sum_jit(arrow_masked))),
+        ("pyarrow pc.sum", _fastest(lambda: pc.sum(arrow_masked))),
+        ("arr.min_max()", _fastest(lambda: _op_min_max_jit(arrow_masked))),
+        ("pyarrow pc.min_max", _fastest(
+            lambda: pc.min_max(arrow_masked))),
+        ("a + b", _fastest(lambda: _op_add_jit(arrow_masked, other))),
+        ("pyarrow pc.add", _fastest(
+            lambda: pc.add(arrow_masked, other))),
+        ("fused dot", _fastest(
+            lambda: _op_dot_jit(arrow_masked, other))),
+        ("pc.mul + pc.sum", _fastest(
+            lambda: pc.sum(pc.multiply(arrow_masked, other)))),
+        ("fused count(x > 500k)", _fastest(
+            lambda: _op_count_gt_jit(arrow_masked, 500_000))),
+        ("pc.greater + pc.sum", _fastest(
+            lambda: pc.sum(pc.greater(arrow_masked, 500_000)))),
+    ], note="1% nulls; a + b returns (values, mask), pyarrow returns one array")
 
 
 if __name__ == "__main__":
