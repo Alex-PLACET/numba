@@ -36,8 +36,11 @@ callback, which is out of scope here. Materialising costs 1.1-2x what
 code, not to replace ``pc.add``.
 
 ``min``/``max``/``min_max`` skip NaN, as ``pyarrow.compute`` does (numpy
-propagates it instead). The comparison folds away for integer dtypes. A
-jit kernel cannot write ``arr.data``: the view is typed read-only, so a
+propagates it instead); the test is ``x != x``, which LLVM folds away for
+integer dtypes and also folds under ``fastmath=True``, where NaN handling
+becomes order-dependent again.
+
+A jit kernel cannot write ``arr.data``: the view is typed read-only, so a
 stray store is a compile error rather than corruption of the producer's
 buffer. Reading ``arr[i]`` from jit code does follow the caller's
 ``boundscheck`` flag on the dense path; the nullable path always checks,
